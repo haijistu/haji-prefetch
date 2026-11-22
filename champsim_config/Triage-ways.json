@@ -1,0 +1,7 @@
+[
+  {"executable_name": "triage-0way", "LLC": {"metadata_ways": 0}},
+  {"executable_name": "triage-1way", "LLC": {"metadata_ways": 1}},
+  {"executable_name": "triage-2way", "LLC": {"metadata_ways": 2}},
+  {"executable_name": "triage-4way", "LLC": {"metadata_ways": 4}},
+  {"executable_name": "triage-8way", "LLC": {"metadata_ways": 8}}
+]

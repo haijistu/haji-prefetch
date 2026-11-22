@@ -120,6 +120,16 @@ struct prefetcher : public bound_to<CACHE> {
   static auto cache_fill_member_impl(long) -> std::false_type;
 
   template <typename T, typename... Args>
+  static auto demand_load_member_impl(int) -> decltype(std::declval<T>().prefetcher_on_demand_load(std::declval<Args>()...), std::true_type{});
+  template <typename, typename...>
+  static auto demand_load_member_impl(long) -> std::false_type;
+
+  template <typename T, typename... Args>
+  static auto eviction_member_impl(int) -> decltype(std::declval<T>().prefetcher_on_evict(std::declval<Args>()...), std::true_type{});
+  template <typename, typename...>
+  static auto eviction_member_impl(long) -> std::false_type;
+
+  template <typename T, typename... Args>
   static auto cycle_operate_member_impl(int) -> decltype(std::declval<T>().prefetcher_cycle_operate(std::declval<Args>()...), std::true_type{});
   template <typename, typename...>
   static auto cycle_operate_member_impl(long) -> std::false_type;
@@ -142,6 +152,12 @@ struct prefetcher : public bound_to<CACHE> {
 
   template <typename T, typename... Args>
   constexpr static bool has_cache_fill = decltype(cache_fill_member_impl<T, Args...>(0))::value;
+
+  template <typename T, typename... Args>
+  constexpr static bool has_demand_load = decltype(demand_load_member_impl<T, Args...>(0))::value;
+
+  template <typename T, typename... Args>
+  constexpr static bool has_eviction = decltype(eviction_member_impl<T, Args...>(0))::value;
 
   template <typename T, typename... Args>
   constexpr static bool has_cycle_operate = decltype(cycle_operate_member_impl<T, Args...>(0))::value;

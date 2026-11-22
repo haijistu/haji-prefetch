@@ -62,6 +62,7 @@ class channel
     champsim::address ip{};
 
     std::vector<uint64_t> instr_depend_on_me{};
+    bool is_instruction = false;
   };
 
   struct response {

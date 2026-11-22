@@ -1,0 +1,11 @@
+{
+  "executable_name": "triage-sms-4way",
+  "L2C": {
+    "prefetcher": {"path": "triage", "class": "triage_sms"}
+  },
+  "LLC": {
+    "metadata_ways": 4,
+    "metadata_max_ways": 0,
+    "metadata_partition_epoch": 0
+  }
+}

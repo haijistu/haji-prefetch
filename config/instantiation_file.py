@@ -76,6 +76,9 @@ cache_builder_parts = {
     'log2_sets': '.log2_sets({log2_sets})',
     'ways': '.ways({ways})',
     'log2_ways': '.log2_ways({log2_ways})',
+    'metadata_ways': '.metadata_ways({metadata_ways})',
+    'metadata_max_ways': '.metadata_max_ways({metadata_max_ways})',
+    'metadata_partition_epoch': '.metadata_partition_epoch({metadata_partition_epoch})',
     'pq_size': '.pq_size({pq_size})',
     'mshr_size': '.mshr_size({mshr_size})',
     'latency': '.latency({latency})',
@@ -142,6 +145,11 @@ def get_cache_builder(elem, ul_pairs):
     '''
     Generate a champsim::cache_builder
     '''
+    for key in ('metadata_ways', 'metadata_max_ways', 'metadata_partition_epoch'):
+        value = elem.get(key, 0)
+        if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError(f'{key} must be a non-negative integer representable by uint32_t')
+
     required_parts = [
         '.name("{name}")',
         '.upper_levels({{{^upper_levels_string}}})',
@@ -395,6 +403,11 @@ def get_instantiation_lines(cores, caches, ptws, pmem, vmem, build_id):
     yield from cache_instantiation_body
     yield from core_instantiation_body
     yield '{'
+    cache_indices = {cache['name']: i for i, cache in enumerate(caches)}
+    for i, cache in enumerate(caches):
+        lower_index = cache_indices.get(cache.get('lower_level'))
+        if lower_index is not None:
+            yield f'  caches.at({i}).connect_lower_cache(caches.at({lower_index}));'
     yield '}'
     yield ''
 

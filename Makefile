@@ -8,6 +8,20 @@ BIN_ROOT:=bin
 OBJ_ROOT:=.csconfig
 DEP_ROOT:=$(OBJ_ROOT)
 
+# Run variables. TRACE can be relative to TRACE_DIR or an absolute path.
+PROGRAM ?= triage-sms-4way
+TRACE_DIR ?= $(HOME)/data/SPEC2006
+TRACE ?=
+LOG_DIR ?= log
+WARMUP_INSTRUCTIONS ?= 200000000
+SIMULATION_INSTRUCTIONS ?= 500000000
+JOBS ?= 16
+
+run_binary = $(BIN_ROOT)/$(PROGRAM)
+run_trace = $(if $(filter /%,$(firstword $(TRACE))),$(TRACE),$(TRACE_DIR)/$(TRACE))
+quote_run_arg = '$(subst ','"'"',$(1))'
+configured_goals = $(filter-out clean compile_commands_clean configclean pytest maketest run run-all,$(or $(MAKECMDGOALS),all))
+
 override MODULE_ROOT += $(ROOT_DIR)
 override BRANCH_ROOT += $(addsuffix /branch,$(MODULE_ROOT))
 override BTB_ROOT += $(addsuffix /btb,$(MODULE_ROOT))
@@ -20,7 +34,7 @@ override CPPFLAGS += -I$(OBJ_ROOT)
 override LDFLAGS  += -L$(TRIPLET_DIR)/lib -L$(TRIPLET_DIR)/lib/manual-link
 override LDLIBS   += -lCLI11 -llzma -lz -lbz2 -lfmt
 
-.PHONY: all clean compile_commands compile_commands_clean configclean test pytest maketest
+.PHONY: all clean compile_commands compile_commands_clean configclean test pytest maketest run run-all
 
 test_main_name=test/bin/000-test-main
 build_ids:=
@@ -208,11 +222,24 @@ $(OBJ_ROOT)/legacy_bridge.h: $$(call legacy_bridge_prereqs,$$(dir $(base_module_
 # Generated configuration makefile contains:
 #  - $(executable_name), the list of all executables in the configuration
 #  - All dependencies and flags assigned according to the modules
-ifeq (,$(filter clean compile_commands_clean configclean pytest maketest, $(MAKECMDGOALS)))
+ifneq (,$(configured_goals))
 include _configuration.mk
 endif
 
 all: $(executable_name)
+
+run:
+	@test -n $(call quote_run_arg,$(strip $(TRACE))) || { printf '%s\n' 'Specify a trace with make run TRACE=<trace-file>.' >&2; exit 2; }
+	@test -f $(call quote_run_arg,$(run_trace)) && test -r $(call quote_run_arg,$(run_trace)) || { printf 'Cannot read trace: %s\n' $(call quote_run_arg,$(run_trace)) >&2; exit 2; }
+	@test -f $(call quote_run_arg,$(run_binary)) && test -x $(call quote_run_arg,$(run_binary)) || { printf 'Cannot execute %s. Build the selected program first.\n' $(call quote_run_arg,$(run_binary)) >&2; exit 2; }
+	$(call quote_run_arg,$(run_binary)) --warmup-instructions $(call quote_run_arg,$(WARMUP_INSTRUCTIONS)) \
+		--simulation-instructions $(call quote_run_arg,$(SIMULATION_INSTRUCTIONS)) $(call quote_run_arg,$(run_trace))
+
+# JOBS limits concurrent simulations. Completed logs serve as resume markers.
+run-all:
+	@LC_ALL=C exec python3 $(call quote_run_arg,$(ROOT_DIR)/scripts/run_all.py) -- \
+		$(call quote_run_arg,$(run_binary)) $(call quote_run_arg,$(TRACE_DIR)) $(call quote_run_arg,$(LOG_DIR)/$(PROGRAM)) \
+		$(call quote_run_arg,$(WARMUP_INSTRUCTIONS)) $(call quote_run_arg,$(SIMULATION_INSTRUCTIONS)) $(call quote_run_arg,$(JOBS))
 
 # Get the base object files, with the 'main' file mangled
 # $1 - A unique key identifying the build
@@ -331,7 +358,7 @@ test: $(test_main_name)
 pytest:
 	PYTHONPATH=$(PYTHONPATH):$(ROOT_DIR) python3 -m unittest discover -v --start-directory='test/python'
 
-ifeq (,$(filter clean compile_commands compile_commands_clean configclean pytest maketest, $(MAKECMDGOALS)))
+ifneq (,$(filter-out compile_commands,$(configured_goals)))
 -include $(patsubst $(OBJ_ROOT)/%.o,$(DEP_ROOT)/%.d,$(foreach build_id,TEST $(build_ids),$(call get_base_objs,$(build_id))) $(test_base_objs) $(base_module_objs))
 endif
 

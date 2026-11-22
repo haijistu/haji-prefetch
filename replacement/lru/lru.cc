@@ -11,7 +11,7 @@ long lru::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, cons
                       champsim::address full_addr, access_type type)
 {
   auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY);
-  auto end = std::next(begin, NUM_WAY);
+  auto end = std::next(begin, intern_ == nullptr ? NUM_WAY : std::min(NUM_WAY, static_cast<long>(intern_->data_ways(static_cast<std::size_t>(set)))));
 
   // Find the way whose last use cycle is most distant
   auto victim = std::min_element(begin, end);

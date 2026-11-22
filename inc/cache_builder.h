@@ -46,6 +46,9 @@ struct cache_builder_base {
   std::optional<uint32_t> m_sets{};
   double m_sets_factor{64};
   std::optional<uint32_t> m_ways{};
+  uint32_t m_metadata_ways{};
+  uint32_t m_metadata_max_ways{};
+  uint32_t m_metadata_partition_epoch{};
   std::size_t m_pq_size{std::numeric_limits<std::size_t>::max()};
   std::optional<uint32_t> m_mshr_size{};
   std::optional<uint64_t> m_hit_lat{};
@@ -90,6 +93,25 @@ class cache_builder : public detail::cache_builder_base
 
 public:
   cache_builder() = default;
+
+  /** Reserve the initial number of ways per set for prefetcher metadata. */
+  self_type& metadata_ways(uint32_t ways)
+  {
+    m_metadata_ways = ways;
+    return *this;
+  }
+
+  self_type& metadata_max_ways(uint32_t ways)
+  {
+    m_metadata_max_ways = ways;
+    return *this;
+  }
+
+  self_type& metadata_partition_epoch(uint32_t accesses)
+  {
+    m_metadata_partition_epoch = accesses;
+    return *this;
+  }
 
   /**
    * Specify the name of the cache.

@@ -29,6 +29,7 @@
 #include <iterator> // for size
 #include <limits>   // for numeric_limits
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -46,6 +47,8 @@
 #include "operable.h"
 #include "util/to_underlying.h" // for to_underlying
 #include "waitable.h"
+
+class lru;
 
 class CACHE : public champsim::operable
 {
@@ -71,6 +74,7 @@ class CACHE : public champsim::operable
     bool prefetch_from_this;
     bool skip_fill;
     bool is_translated;
+    bool is_instruction;
     bool translate_issued = false;
 
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
@@ -114,7 +118,9 @@ public:
 
 private:
   bool try_hit(const tag_lookup_type& handle_pkt);
+  void notify_prefetcher_demand_load(const tag_lookup_type& packet, bool hit, bool useful_prefetch, uint32_t fill_metadata = 0);
   bool handle_fill(const fill_type& fill);
+  bool enqueue_writeback(const champsim::cache_block& victim, uint32_t cpu, uint64_t instr_id);
   bool handle_miss(const tag_lookup_type& handle_pkt);
   bool handle_write(const tag_lookup_type& handle_pkt);
   void finish_packet(const response_type& packet);
@@ -128,6 +134,70 @@ public:
 private:
   static BLOCK fill_block(fill_type fill, uint32_t metadata);
   using set_type = std::vector<BLOCK>;
+
+  static constexpr unsigned metadata_tag_bits = 10;
+  static constexpr unsigned metadata_target_bits = 31;
+  static constexpr unsigned metadata_confidence_bit = metadata_tag_bits + metadata_target_bits;
+  static constexpr unsigned metadata_entry_bits = metadata_confidence_bit + 1;
+  static constexpr uint64_t metadata_tag_mask = (uint64_t{1} << metadata_tag_bits) - 1;
+  static constexpr uint64_t metadata_target_mask = (uint64_t{1} << metadata_target_bits) - 1;
+  static constexpr std::size_t metadata_entries_per_way = 512 / metadata_entry_bits;
+
+  struct metadata_line {
+    // Twelve 42-bit entries in a 64-byte line, leaving the top eight bits unused.
+    std::array<uint64_t, 8> payload{};
+    // LRU timestamps model replacement state separately. A zero timestamp is invalid.
+    std::array<uint64_t, metadata_entries_per_way> last_used{};
+
+    [[nodiscard]] uint64_t read(std::size_t slot) const;
+    void write(std::size_t slot, uint64_t entry);
+  };
+
+  struct metadata_position {
+    metadata_line* line{};
+    std::size_t slot{};
+    bool hit{};
+  };
+
+  struct metadata_dueller {
+    struct sampled_set {
+      std::vector<uint64_t> data;
+      std::vector<uint64_t> markov;
+    };
+
+    std::vector<int> sample_by_set;
+    std::vector<sampled_set> samples;
+    std::vector<uint64_t> scores;
+  };
+
+  struct metadata_partition {
+    std::vector<uint32_t> ways_by_set;
+    uint32_t target;
+    uint32_t epoch_length;
+    uint32_t next_set{};
+    uint32_t demand_accesses{};
+    uint32_t demand_misses{};
+    uint64_t lookups{};
+    uint64_t hits{};
+    uint64_t training_pairs{};
+    int last_vote{};
+    std::optional<metadata_dueller> dueller{};
+  };
+
+  [[nodiscard]] uint64_t metadata_tag(uint64_t trigger) const;
+  [[nodiscard]] metadata_position find_metadata(uint64_t trigger, uint64_t tag);
+  [[nodiscard]] uint32_t metadata_ways_for_set(std::size_t set) const;
+  void observe_partition_access(champsim::address addr, bool hit);
+  void observe_dueller_metadata(uint64_t trigger, bool allocate);
+  void observe_dueller_data(uint64_t line);
+  long advance_metadata_partition();
+  uint32_t reserved_metadata_ways{};
+  uint32_t metadata_capacity_ways{};
+  std::optional<metadata_partition> partition{};
+  std::vector<metadata_line> metadata_table{};
+  uint64_t metadata_clock{};
+  std::vector<uint64_t> metadata_set_revisions{};
+  CACHE* lower_cache{};
 
   std::pair<set_type::iterator, set_type::iterator> get_set_span(champsim::address address);
   [[nodiscard]] std::pair<set_type::const_iterator, set_type::const_iterator> get_set_span(champsim::address address) const;
@@ -157,6 +227,20 @@ public:
   uint32_t cpu = 0;
   std::string NAME;
   uint32_t NUM_SET, NUM_WAY, MSHR_SIZE;
+  [[nodiscard]] uint32_t data_ways() const { return NUM_WAY - reserved_metadata_ways; }
+  [[nodiscard]] uint32_t data_ways(std::size_t set) const { return NUM_WAY - metadata_ways_for_set(set); }
+  [[nodiscard]] uint32_t metadata_ways() const { return reserved_metadata_ways; }
+  [[nodiscard]] uint32_t max_metadata_ways() const { return metadata_capacity_ways; }
+  [[nodiscard]] uint64_t max_metadata_entries() const { return uint64_t{NUM_SET} * metadata_capacity_ways * metadata_entries_per_way; }
+  bool request_metadata_ways(uint32_t ways);
+  void enable_metadata_dueller();
+  void observe_reused_metadata(champsim::block_number trigger);
+  [[nodiscard]] uint64_t metadata_revision(champsim::block_number trigger) const;
+  [[nodiscard]] bool has_demanded_line(champsim::block_number line) const;
+  void connect_lower_cache(CACHE& cache) { lower_cache = &cache; }
+  [[nodiscard]] CACHE* get_lower_cache() const { return lower_cache; }
+  [[nodiscard]] std::optional<champsim::block_number> lookup_metadata(champsim::block_number trigger);
+  void update_metadata(champsim::block_number trigger, champsim::block_number target);
   std::size_t PQ_SIZE;
   champsim::chrono::clock::duration HIT_LATENCY;
   champsim::chrono::clock::duration FILL_LATENCY;
@@ -227,6 +311,8 @@ public:
     virtual void bind(CACHE* cache) = 0;
 
     virtual void impl_prefetcher_initialize() = 0;
+    virtual void impl_prefetcher_on_demand_load(champsim::address addr, champsim::address ip, bool hit, bool useful_prefetch, uint32_t fill_metadata) = 0;
+    virtual void impl_prefetcher_on_evict(champsim::address addr) = 0;
     virtual uint32_t impl_prefetcher_cache_operate(champsim::address addr, champsim::address ip, bool cache_hit, bool useful_prefetch, access_type type,
                                                    uint32_t metadata_in) = 0;
     virtual uint32_t impl_prefetcher_cache_fill(champsim::address addr, long set, long way, bool prefetch, champsim::address evicted_addr,
@@ -261,6 +347,26 @@ public:
     }
 
     void impl_prefetcher_initialize() final;
+    void impl_prefetcher_on_demand_load(champsim::address addr, champsim::address ip, bool hit, bool useful_prefetch, uint32_t fill_metadata) final
+    {
+      [[maybe_unused]] auto notify = [&](auto& p) {
+        using prefetcher = champsim::modules::prefetcher;
+        if constexpr (prefetcher::has_demand_load<decltype(p), champsim::address, champsim::address, bool, bool, uint32_t>)
+          p.prefetcher_on_demand_load(addr, ip, hit, useful_prefetch, fill_metadata);
+        else if constexpr (prefetcher::has_demand_load<decltype(p), champsim::address, champsim::address, bool, bool>)
+          p.prefetcher_on_demand_load(addr, ip, hit, useful_prefetch);
+      };
+      std::apply([&](auto&... p) { (..., notify(p)); }, intern_);
+    }
+
+    void impl_prefetcher_on_evict(champsim::address addr) final
+    {
+      [[maybe_unused]] auto notify = [&](auto& p) {
+        if constexpr (champsim::modules::prefetcher::has_eviction<decltype(p), champsim::address>)
+          p.prefetcher_on_evict(addr);
+      };
+      std::apply([&](auto&... p) { (..., notify(p)); }, intern_);
+    }
     [[nodiscard]] uint32_t impl_prefetcher_cache_operate(champsim::address addr, champsim::address ip, bool cache_hit, bool useful_prefetch, access_type type,
                                                          uint32_t metadata_in) final;
     [[nodiscard]] uint32_t impl_prefetcher_cache_fill(champsim::address addr, long set, long way, bool prefetch, champsim::address evicted_addr,
@@ -317,12 +423,27 @@ public:
 
   template <typename... Ps, typename... Rs>
   explicit CACHE(champsim::cache_builder<champsim::cache_builder_module_type_holder<Ps...>, champsim::cache_builder_module_type_holder<Rs...>> b)
-      : champsim::operable(b.m_clock_period), upper_levels(b.m_uls), lower_level(b.m_ll), lower_translate(b.m_lt), NAME(b.m_name), NUM_SET(b.get_num_sets()),
+      : champsim::operable(b.m_clock_period), reserved_metadata_ways(b.m_metadata_ways),
+        metadata_capacity_ways(b.m_metadata_max_ways == 0 ? b.m_metadata_ways : b.m_metadata_max_ways), upper_levels(b.m_uls), lower_level(b.m_ll),
+        lower_translate(b.m_lt), NAME(b.m_name), NUM_SET(b.get_num_sets()),
         NUM_WAY(b.get_num_ways()), MSHR_SIZE(b.get_num_mshrs()), PQ_SIZE(b.m_pq_size), HIT_LATENCY(b.get_hit_latency() * b.m_clock_period),
         FILL_LATENCY(b.get_fill_latency() * b.m_clock_period), OFFSET_BITS(b.m_offset_bits), MAX_TAG(b.get_tag_bandwidth()), MAX_FILL(b.get_fill_bandwidth()),
         prefetch_as_load(b.m_pref_load), match_offset_bits(b.m_wq_full_addr), virtual_prefetch(b.m_va_pref), pref_activate_mask(b.m_pref_act_mask),
         pref_module_pimpl(std::make_unique<prefetcher_module_model<Ps...>>(this)), repl_module_pimpl(std::make_unique<replacement_module_model<Rs...>>(this))
   {
+    if (b.m_metadata_partition_epoch != 0 && b.m_metadata_max_ways == 0)
+      throw std::invalid_argument{"A metadata partition epoch requires metadata_max_ways"};
+    if (metadata_capacity_ways != 0) {
+      if (reserved_metadata_ways > metadata_capacity_ways || metadata_capacity_ways >= NUM_WAY || OFFSET_BITS != champsim::data::bits{6})
+        throw std::invalid_argument{"Metadata partition requires initial ways <= maximum ways, at least one data way, and 64-byte cache lines"};
+      if (NUM_SET == 0 || (NUM_SET & (NUM_SET - 1)) != 0)
+        throw std::invalid_argument{"Metadata partition requires a positive power-of-two set count"};
+      if constexpr (!std::is_same_v<champsim::cache_builder_module_type_holder<Rs...>, champsim::cache_builder_module_type_holder<lru>>)
+        throw std::invalid_argument{"Metadata partition requires the lru replacement module"};
+      metadata_table.resize(static_cast<std::size_t>(NUM_SET) * metadata_capacity_ways);
+      if (b.m_metadata_max_ways != 0)
+        partition = metadata_partition{std::vector<uint32_t>(NUM_SET, reserved_metadata_ways), reserved_metadata_ways, b.m_metadata_partition_epoch};
+    }
   }
 
   CACHE(const CACHE&) = delete;

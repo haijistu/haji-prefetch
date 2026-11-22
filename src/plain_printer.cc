@@ -124,6 +124,36 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
         fmt::format("cpu{}->{} AVERAGE MISS LATENCY: {} cycles", cpu, stats.name, ::print_ratio(stats.total_miss_latency_cycles, total_downstream_demands)));
   }
 
+  if (stats.partition.enabled) {
+    const auto& part = stats.partition;
+    lines.push_back(fmt::format("{} METADATA PARTITION: WAYS {} CHANGES {} WAY_TRANSFERS {} DATA_EVICTIONS {} DIRTY_WRITEBACKS {} WQ_STALLS {} METADATA_EVICTIONS {}",
+                                stats.name, part.ways_at_end, part.changes, part.way_transfers, part.data_evictions, part.dirty_writebacks,
+                                part.writeback_stalls, part.metadata_evictions));
+  }
+
+  if (stats.sms_filter.enabled) {
+    const auto& sms = stats.sms_filter;
+    lines.push_back(fmt::format("{} SMS FILTER: L2_MISSES {} L2_PREFETCH_HITS {} PASSED_L2_MISSES {} PASSED_L2_PREFETCH_HITS {} "
+                                "MISS_PASS_RATE {} PREFETCH_HIT_PASS_RATE {}",
+                                stats.name, sms.l2_misses, sms.l2_prefetch_hits, sms.passed_l2_misses, sms.passed_l2_prefetch_hits,
+                                ::print_ratio(sms.passed_l2_misses, sms.l2_misses), ::print_ratio(sms.passed_l2_prefetch_hits, sms.l2_prefetch_hits)));
+    const auto print_pairs = [&](std::string_view source, const auto& pairs) {
+      lines.push_back(fmt::format("{} SMS TRIAGE PAIRS {}: TOTAL {} SAME_REGION {} CROSS_REGION {} SAME_REGION_RATE {}", stats.name, source,
+                                  pairs.total(), pairs.same_region, pairs.cross_region, ::print_ratio(pairs.same_region, pairs.total())));
+    };
+    print_pairs("ALL", sms.all_pairs());
+    print_pairs("L2_MISS", sms.pairs_from_misses);
+    print_pairs("L2_PREFETCH_HIT", sms.pairs_from_prefetch_hits);
+  }
+
+  if (stats.triangel.enabled) {
+    const auto& tri = stats.triangel;
+    lines.push_back(fmt::format("{} TRIANGEL: TRAINING_ACCESSES {} HISTORY_SAMPLES {} HISTORY_MATCHES {} SECOND_CHANCE_HITS {} "
+                                "CORRELATIONS {} LOOKAHEAD2_CORRELATIONS {} MARKOV_LOOKUPS {} REUSE_BUFFER_HITS {} PREDICTIONS_ISSUED {}",
+                                stats.name, tri.training_accesses, tri.history_samples, tri.history_matches, tri.second_chance_hits, tri.correlations,
+                                tri.lookahead2_correlations, tri.markov_lookups, tri.reuse_buffer_hits, tri.predictions_issued));
+  }
+
   return lines;
 }
 

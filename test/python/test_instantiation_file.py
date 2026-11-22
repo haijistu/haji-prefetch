@@ -139,6 +139,20 @@ class CacheBuilderTests(unittest.TestCase):
     def test_log2_ways(self):
         self.get_element_diff(['.log2_ways(1)'], log2_ways=1)
 
+    def test_metadata_ways(self):
+        for ways in (0, 1, 2, 4, 8):
+            with self.subTest(ways=ways):
+                self.get_element_diff([f'.metadata_ways({ways})'], metadata_ways=ways)
+
+    def test_invalid_metadata_ways(self):
+        for ways in (-1, 1.5, True, "4", 1 << 32):
+            with self.subTest(ways=ways), self.assertRaisesRegex(ValueError, 'metadata_ways'):
+                self.get_element_diff([], metadata_ways=ways)
+
+    def test_dynamic_metadata_partition(self):
+        self.get_element_diff(['.metadata_max_ways(8)', '.metadata_partition_epoch(4096)'],
+                              metadata_max_ways=8, metadata_partition_epoch=4096)
+
     def test_pq_size(self):
         self.get_element_diff(['.pq_size(1)'], pq_size=1)
 

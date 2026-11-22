@@ -275,7 +275,7 @@ class NormalizedConfiguration:
         # The name 'DRAM' is reserved for the physical memory
         self.caches = {k:v for k,v in self.caches.items() if k != 'DRAM'}
 
-        self.pmem = config_file.get('physical_memory', {})
+        self.pmem = dict(config_file.get('physical_memory', {}))
         
         #this allows frequency to be specified instead of data rate or vice-versa for DRAM
         if('frequency' in self.pmem.keys()):

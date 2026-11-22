@@ -1,0 +1,8 @@
+{
+  "executable_name": "triage-dynamic",
+  "LLC": {
+    "metadata_ways": 0,
+    "metadata_max_ways": 8,
+    "metadata_partition_epoch": 4096
+  }
+}

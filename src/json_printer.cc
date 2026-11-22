@@ -51,6 +51,50 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
   statsmap.emplace("prefetch issued", stats.pf_issued);
   statsmap.emplace("useful prefetch", stats.pf_useful);
   statsmap.emplace("useless prefetch", stats.pf_useless);
+  if (stats.sms_filter.enabled) {
+    const auto& sms = stats.sms_filter;
+    const auto rate = [](uint64_t passed, uint64_t total) {
+      return total == 0 ? nlohmann::json(nullptr) : nlohmann::json(static_cast<double>(passed) / static_cast<double>(total));
+    };
+    const auto pair_stats = [&](const auto& pairs) {
+      return nlohmann::json{{"total", pairs.total()},
+                            {"same region", pairs.same_region},
+                            {"cross region", pairs.cross_region},
+                            {"same region rate", rate(pairs.same_region, pairs.total())}};
+    };
+    statsmap.emplace("sms filter", nlohmann::json{{"l2 misses", sms.l2_misses},
+                                                 {"l2 prefetch hits", sms.l2_prefetch_hits},
+                                                 {"passed l2 misses", sms.passed_l2_misses},
+                                                 {"passed l2 prefetch hits", sms.passed_l2_prefetch_hits},
+                                                 {"l2 miss pass rate", rate(sms.passed_l2_misses, sms.l2_misses)},
+                                                 {"l2 prefetch hit pass rate", rate(sms.passed_l2_prefetch_hits, sms.l2_prefetch_hits)},
+                                                 {"training pairs", {{"all", pair_stats(sms.all_pairs())},
+                                                                     {"l2 miss", pair_stats(sms.pairs_from_misses)},
+                                                                     {"l2 prefetch hit", pair_stats(sms.pairs_from_prefetch_hits)}}}});
+  }
+  if (stats.triangel.enabled) {
+    const auto& tri = stats.triangel;
+    statsmap.emplace("triangel", nlohmann::json{{"training accesses", tri.training_accesses},
+                                               {"history samples", tri.history_samples},
+                                               {"history matches", tri.history_matches},
+                                               {"second chance hits", tri.second_chance_hits},
+                                               {"correlations", tri.correlations},
+                                               {"lookahead2 correlations", tri.lookahead2_correlations},
+                                               {"markov lookups", tri.markov_lookups},
+                                               {"reuse buffer hits", tri.reuse_buffer_hits},
+                                               {"predictions issued", tri.predictions_issued}});
+  }
+
+  if (stats.partition.enabled) {
+    const auto& part = stats.partition;
+    statsmap.emplace("metadata partition", nlohmann::json{{"ways at end", part.ways_at_end},
+                                                         {"changes", part.changes},
+                                                         {"way transfers", part.way_transfers},
+                                                         {"data evictions", part.data_evictions},
+                                                         {"dirty writebacks", part.dirty_writebacks},
+                                                         {"writeback stalls", part.writeback_stalls},
+                                                         {"metadata evictions", part.metadata_evictions}});
+  }
 
   uint64_t total_downstream_demands = stats.fill.total();
   for (std::size_t cpu = 0; cpu < NUM_CPUS; ++cpu)

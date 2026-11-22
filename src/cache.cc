@@ -21,6 +21,8 @@
 #include <cmath>
 #include <iomanip>
 #include <numeric>
+#include <random>
+#include <utility>
 #include <fmt/core.h>
 
 #include "bandwidth.h"
@@ -34,6 +36,9 @@
 
 CACHE::CACHE(CACHE&& other)
     : operable(other),
+      reserved_metadata_ways(other.reserved_metadata_ways), metadata_capacity_ways(other.metadata_capacity_ways), partition(std::move(other.partition)),
+      metadata_table(std::move(other.metadata_table)), metadata_clock(other.metadata_clock), metadata_set_revisions(std::move(other.metadata_set_revisions)),
+      lower_cache(other.lower_cache),
 
       upper_levels(std::move(other.upper_levels)), lower_level(std::move(other.lower_level)), lower_translate(std::move(other.lower_translate)),
 
@@ -55,6 +60,14 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->clock_period = other.clock_period;
   this->current_time = other.current_time;
   this->warmup = other.warmup;
+
+  this->reserved_metadata_ways = other.reserved_metadata_ways;
+  this->metadata_capacity_ways = other.metadata_capacity_ways;
+  this->partition = std::move(other.partition);
+  this->metadata_table = std::move(other.metadata_table);
+  this->metadata_clock = other.metadata_clock;
+  this->metadata_set_revisions = std::move(other.metadata_set_revisions);
+  this->lower_cache = other.lower_cache;
 
   this->upper_levels = std::move(other.upper_levels);
   this->lower_level = std::move(other.lower_level);
@@ -94,7 +107,8 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
 
 CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref, bool skip)
     : address(req.address), v_address(req.v_address), data(req.data), ip(req.ip), instr_id(req.instr_id), pf_metadata(req.pf_metadata), cpu(req.cpu),
-      type(req.type), prefetch_from_this(local_pref), skip_fill(skip), is_translated(req.is_translated), instr_depend_on_me(req.instr_depend_on_me)
+      type(req.type), prefetch_from_this(local_pref), skip_fill(skip), is_translated(req.is_translated), is_instruction(req.is_instruction),
+      instr_depend_on_me(req.instr_depend_on_me)
 {
 }
 
@@ -148,6 +162,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   to_fill.v_address = fill.v_address;
   to_fill.data = fill.data_promise->data;
   to_fill.pf_metadata = metadata;
+  to_fill.cpu = fill.cpu;
 
   return to_fill;
 }
@@ -166,6 +181,19 @@ champsim::address CACHE::module_address(const T& element) const
   return champsim::address{address.slice_upper(match_offset_bits ? champsim::data::bits{} : OFFSET_BITS)};
 }
 
+bool CACHE::enqueue_writeback(const BLOCK& victim, uint32_t triggering_cpu, uint64_t instr_id)
+{
+  request_type packet;
+  packet.cpu = triggering_cpu;
+  packet.address = victim.address;
+  packet.data = victim.data;
+  packet.instr_id = instr_id;
+  packet.type = access_type::WRITE;
+  packet.pf_metadata = victim.pf_metadata;
+  packet.response_requested = false;
+  return lower_level->add_wq(packet);
+}
+
 bool CACHE::handle_fill(const fill_type& fill)
 {
   cpu = fill.cpu;
@@ -174,12 +202,15 @@ bool CACHE::handle_fill(const fill_type& fill)
   auto [set_begin, set_end] = get_set_span(fill.address);
   auto way = std::find_if_not(set_begin, set_end, [](auto x) { return x.valid; });
   if (way == set_end) {
-    way = std::next(set_begin, impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type));
+    const auto victim = impl_find_victim(fill.cpu, fill.instr_id, get_set_index(fill.address), &*set_begin, fill.ip, fill.address, fill.type);
+    assert(victim == NUM_WAY || (victim >= 0 && victim < std::distance(set_begin, set_end)));
+    if (victim != NUM_WAY)
+      way = std::next(set_begin, victim);
   }
   assert(set_begin <= way);
   assert(way <= set_end);
   assert(way != set_end || fill.type != access_type::WRITE); // Writes may not bypass
-  const auto way_idx = std::distance(set_begin, way);        // cast protected by earlier assertion
+  const auto way_idx = way == set_end ? static_cast<long>(NUM_WAY) : std::distance(set_begin, way);
 
   if constexpr (champsim::debug_print) {
     fmt::print("[{}] {} instr_id: {} address: {} v_address: {} set: {} way: {} type: {} prefetch_metadata: {} cycle_enqueued: {} cycle: {}\n", NAME, __func__,
@@ -188,24 +219,10 @@ bool CACHE::handle_fill(const fill_type& fill)
   }
 
   if (way != set_end && way->valid && way->dirty) {
-    request_type writeback_packet;
-
-    writeback_packet.cpu = fill.cpu;
-    writeback_packet.address = way->address;
-    writeback_packet.data = way->data;
-    writeback_packet.instr_id = fill.instr_id;
-    writeback_packet.ip = champsim::address{};
-    writeback_packet.type = access_type::WRITE;
-    writeback_packet.pf_metadata = way->pf_metadata;
-    writeback_packet.response_requested = false;
-
     if constexpr (champsim::debug_print) {
-      fmt::print("[{}] {} evict address: {} v_address: {} prefetch_metadata: {}\n", NAME, __func__, writeback_packet.address, writeback_packet.v_address,
-                 fill.data_promise->pf_metadata);
+      fmt::print("[{}] {} evict address: {} v_address: {} prefetch_metadata: {}\n", NAME, __func__, way->address, way->v_address, way->pf_metadata);
     }
-
-    auto success = lower_level->add_wq(writeback_packet);
-    if (!success) {
+    if (!enqueue_writeback(*way, fill.cpu, fill.instr_id)) {
       return false;
     }
   }
@@ -220,6 +237,8 @@ bool CACHE::handle_fill(const fill_type& fill)
   impl_replacement_cache_fill(fill.cpu, get_set_index(fill.address), way_idx, module_address(fill), fill.ip, evicting_address, fill.type);
 
   if (way != set_end) {
+    if (way->valid)
+      pref_module_pimpl->impl_prefetcher_on_evict(way->address);
     if (way->valid && way->prefetch) {
       ++sim_stats.pf_useless;
     }
@@ -266,11 +285,12 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   }
 
   // update replacement policy
-  const auto way_idx = std::distance(set_begin, way);
+  const auto way_idx = hit ? std::distance(set_begin, way) : static_cast<long>(NUM_WAY);
   impl_update_replacement_state(handle_pkt.cpu, get_set_index(handle_pkt.address), way_idx, module_address(handle_pkt), handle_pkt.ip, {}, handle_pkt.type,
                                 hit);
 
   if (hit) {
+    notify_prefetcher_demand_load(handle_pkt, true, useful_prefetch, way->pf_metadata);
     sim_stats.hits.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
 
     response_type response{handle_pkt.address, handle_pkt.v_address, way->data, metadata_thru, handle_pkt.instr_depend_on_me};
@@ -278,7 +298,16 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
       ret->push_back(response);
     }
 
-    way->dirty |= (handle_pkt.type == access_type::WRITE);
+    if (handle_pkt.type == access_type::WRITE) {
+      way->dirty = true;
+      way->cpu = handle_pkt.cpu;
+      if (!match_offset_bits) {
+        way->data = handle_pkt.data;
+        way->pf_metadata = handle_pkt.pf_metadata;
+      }
+    }
+    if (handle_pkt.type == access_type::LOAD || handle_pkt.type == access_type::RFO)
+      observe_partition_access(handle_pkt.address, true);
 
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
@@ -288,6 +317,12 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
   }
 
   return hit;
+}
+
+void CACHE::notify_prefetcher_demand_load(const tag_lookup_type& packet, bool hit, bool useful_prefetch, uint32_t fill_metadata)
+{
+  if (packet.type == access_type::LOAD && !packet.is_instruction)
+    pref_module_pimpl->impl_prefetcher_on_demand_load(packet.address, packet.ip, hit, useful_prefetch, fill_metadata);
 }
 
 auto CACHE::mshr_and_forward_packet(const tag_lookup_type& handle_pkt) -> std::pair<fill_type, request_type>
@@ -307,6 +342,7 @@ auto CACHE::mshr_and_forward_packet(const tag_lookup_type& handle_pkt) -> std::p
   fwd_pkt.data = handle_pkt.data;
   fwd_pkt.instr_id = handle_pkt.instr_id;
   fwd_pkt.ip = handle_pkt.ip;
+  fwd_pkt.is_instruction = handle_pkt.is_instruction;
 
   fwd_pkt.instr_depend_on_me = handle_pkt.instr_depend_on_me;
   fwd_pkt.response_requested = (!handle_pkt.prefetch_from_this || !handle_pkt.skip_fill);
@@ -355,6 +391,10 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       return false;  // TODO should we allow prefetches anyway if they will not be filled to this level?
     }
 
+    // Do not let a refetch overtake a dirty line retired into the link write queue.
+    if (partition && std::any_of(lower_level->WQ.begin(), lower_level->WQ.end(), matches_address(handle_pkt.address)))
+      return false;
+
     const bool send_to_rq = (prefetch_as_load || handle_pkt.type != access_type::PREFETCH);
     bool success = send_to_rq ? lower_level->add_rq(mshr_pkt.second) : lower_level->add_pq(mshr_pkt.second);
 
@@ -369,6 +409,9 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
   }
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
+  notify_prefetcher_demand_load(handle_pkt, false, false);
+  if (handle_pkt.type == access_type::LOAD || handle_pkt.type == access_type::RFO)
+    observe_partition_access(handle_pkt.address, false);
 
   return true;
 }
@@ -382,7 +425,8 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   }
 
   fill_type to_allocate{handle_pkt, current_time};
-  to_allocate.data_promise.ready_at(current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY));
+  to_allocate.data_promise = champsim::waitable{fill_type::returned_value{handle_pkt.data, handle_pkt.pf_metadata},
+                                               current_time + (warmup ? champsim::chrono::clock::duration{} : FILL_LATENCY)};
   inflight_fills.push_back(to_allocate);
 
   sim_stats.misses.increment(std::pair{handle_pkt.type, handle_pkt.cpu});
@@ -436,6 +480,8 @@ long CACHE::operate()
     progress += std::distance(std::cbegin(lower_translate->returned), std::cend(lower_translate->returned));
     lower_translate->returned.clear();
   }
+
+  progress += advance_metadata_partition();
 
   // Perform fills
   champsim::bandwidth fill_bw{MAX_FILL};
@@ -538,14 +584,322 @@ auto CACHE::get_set_span(champsim::address address) -> std::pair<set_type::itera
 {
   const auto set_idx = get_set_index(address);
   assert(set_idx < NUM_SET);
-  return get_span(std::begin(block), static_cast<set_type::difference_type>(set_idx), NUM_WAY); // safe cast because of prior assert
+  const auto begin = std::next(std::begin(block), static_cast<set_type::difference_type>(set_idx) * NUM_WAY);
+  return {begin, std::next(begin, data_ways(static_cast<std::size_t>(set_idx)))};
 }
 
 auto CACHE::get_set_span(champsim::address address) const -> std::pair<set_type::const_iterator, set_type::const_iterator>
 {
   const auto set_idx = get_set_index(address);
   assert(set_idx < NUM_SET);
-  return get_span(std::cbegin(block), static_cast<set_type::difference_type>(set_idx), NUM_WAY); // safe cast because of prior assert
+  const auto begin = std::next(std::cbegin(block), static_cast<set_type::difference_type>(set_idx) * NUM_WAY);
+  return {begin, std::next(begin, data_ways(static_cast<std::size_t>(set_idx)))};
+}
+
+uint32_t CACHE::metadata_ways_for_set(std::size_t set) const
+{
+  return partition ? partition->ways_by_set.at(set) : reserved_metadata_ways;
+}
+
+bool CACHE::request_metadata_ways(uint32_t ways)
+{
+  if (!partition || ways > metadata_capacity_ways || partition->target != reserved_metadata_ways)
+    return false;
+
+  partition->target = ways;
+  partition->next_set = 0;
+  return true;
+}
+
+void CACHE::enable_metadata_dueller()
+{
+  if (metadata_capacity_ways != 0 && metadata_set_revisions.empty())
+    metadata_set_revisions.resize(NUM_SET);
+  if (!partition || partition->epoch_length == 0 || partition->dueller)
+    return;
+
+  auto& dueller = partition->dueller.emplace();
+  const auto count = std::min(NUM_SET, 64u);
+  dueller.sample_by_set.resize(NUM_SET, -1);
+  dueller.samples.resize(count);
+  dueller.scores.resize(metadata_capacity_ways + 1);
+  std::minstd_rand rng{1};
+  for (uint32_t sample = 0; sample < count; ++sample) {
+    const auto first = sample * NUM_SET / count;
+    const auto last = (sample + 1) * NUM_SET / count;
+    const auto set = std::uniform_int_distribution<uint32_t>{first, last - 1}(rng);
+    dueller.sample_by_set[set] = static_cast<int>(sample);
+    dueller.samples[sample].data.reserve(NUM_WAY);
+    dueller.samples[sample].markov.reserve(metadata_capacity_ways * metadata_entries_per_way);
+  }
+}
+
+uint64_t CACHE::metadata_revision(champsim::block_number trigger) const
+{
+  return metadata_set_revisions.empty() ? 0 : metadata_set_revisions[trigger.to<uint64_t>() % NUM_SET];
+}
+
+void CACHE::observe_reused_metadata(champsim::block_number trigger)
+{
+  // The shadow partition estimates mapping reuse even when the request bypasses the real LLC metadata.
+  observe_dueller_metadata(trigger.to<uint64_t>(), false);
+}
+
+bool CACHE::has_demanded_line(champsim::block_number line) const
+{
+  const champsim::address addr{line};
+  const auto [first, last] = get_set_span(addr);
+  return std::any_of(first, last, [matches = matches_address(addr)](const auto& entry) { return entry.valid && !entry.prefetch && matches(entry); });
+}
+
+namespace
+{
+std::optional<std::size_t> access_lru_stack(std::vector<uint64_t>& stack, uint64_t key, std::size_t capacity, bool allocate)
+{
+  auto it = std::find(stack.begin(), stack.end(), key);
+  if (it != stack.end()) {
+    const auto rank = static_cast<std::size_t>(std::distance(stack.begin(), it));
+    std::rotate(stack.begin(), it, std::next(it));
+    return rank;
+  }
+  if (allocate) {
+    if (stack.size() == capacity)
+      stack.pop_back();
+    stack.insert(stack.begin(), key);
+  }
+  return std::nullopt;
+}
+} // namespace
+
+void CACHE::observe_dueller_data(uint64_t line)
+{
+  auto& dueller = *partition->dueller;
+  const auto sample = dueller.sample_by_set[line % NUM_SET];
+  if (sample < 0)
+    return;
+
+  const auto rank = access_lru_stack(dueller.samples[sample].data, line, NUM_WAY, true);
+  if (rank)
+    for (std::size_t ways = 0; ways < dueller.scores.size() && *rank < NUM_WAY - ways; ++ways)
+      dueller.scores[ways] += 2;
+}
+
+void CACHE::observe_dueller_metadata(uint64_t trigger, bool allocate)
+{
+  if (!partition || !partition->dueller || partition->target != reserved_metadata_ways)
+    return;
+
+  auto& dueller = *partition->dueller;
+  const auto sample = dueller.sample_by_set[trigger % NUM_SET];
+  if (sample < 0)
+    return;
+
+  const auto rank = access_lru_stack(dueller.samples[sample].markov, metadata_tag(trigger), metadata_capacity_ways * metadata_entries_per_way, allocate);
+  if (rank && !allocate)
+    for (auto ways = 1 + *rank / metadata_entries_per_way; ways < dueller.scores.size(); ++ways)
+      ++dueller.scores[ways];
+}
+
+long CACHE::advance_metadata_partition()
+{
+  if (!partition || partition->target == reserved_metadata_ways)
+    return 0;
+
+  const auto set = partition->next_set;
+  auto& metadata_ways = partition->ways_by_set[set];
+  auto& stats = sim_stats.partition;
+  if (metadata_ways < partition->target) {
+    auto& retired = block[static_cast<std::size_t>(set) * NUM_WAY + NUM_WAY - metadata_ways - 1];
+    if (retired.valid && retired.dirty) {
+      if (!enqueue_writeback(retired, retired.cpu, 0)) {
+        ++stats.writeback_stalls;
+        return 0;
+      }
+      ++stats.dirty_writebacks;
+    }
+    stats.data_evictions += retired.valid;
+    sim_stats.pf_useless += retired.valid && retired.prefetch;
+    if (retired.valid)
+      pref_module_pimpl->impl_prefetcher_on_evict(retired.address);
+    retired = {};
+    ++metadata_ways;
+  } else {
+    auto& retired = metadata_table[static_cast<std::size_t>(set) * metadata_capacity_ways + metadata_ways - 1];
+    stats.metadata_evictions += static_cast<uint64_t>(std::count_if(retired.last_used.begin(), retired.last_used.end(), [](auto stamp) { return stamp != 0; }));
+    retired = {};
+    if (!metadata_set_revisions.empty())
+      ++metadata_set_revisions[set];
+    --metadata_ways;
+  }
+
+  ++stats.way_transfers;
+  if (metadata_ways == partition->target && ++partition->next_set == NUM_SET) {
+    reserved_metadata_ways = partition->target;
+    stats.ways_at_end = reserved_metadata_ways;
+    ++stats.changes;
+  }
+  return 1;
+}
+
+void CACHE::observe_partition_access(champsim::address addr, bool hit)
+{
+  if (!partition || partition->epoch_length == 0 || partition->target != reserved_metadata_ways)
+    return;
+
+  auto& state = *partition;
+  if (state.dueller) {
+    observe_dueller_data(champsim::block_number{addr}.to<uint64_t>());
+    if (++state.demand_accesses == state.epoch_length) {
+      auto& scores = state.dueller->scores;
+      const auto best = std::max_element(scores.begin(), scores.end());
+      const auto current = scores[reserved_metadata_ways];
+      if (*best > current + current / 16)
+        request_metadata_ways(static_cast<uint32_t>(std::distance(scores.begin(), best)));
+      std::fill(scores.begin(), scores.end(), 0);
+      state.demand_accesses = 0;
+    }
+    return;
+  }
+
+  state.demand_misses += !hit;
+  if (++state.demand_accesses < state.epoch_length)
+    return;
+
+  const auto accesses = std::exchange(state.demand_accesses, 0);
+  const auto misses = std::exchange(state.demand_misses, 0);
+  const auto lookups = std::exchange(state.lookups, 0);
+  const auto hits = std::exchange(state.hits, 0);
+  const auto pairs = std::exchange(state.training_pairs, 0);
+
+  // Compare observed demand pressure and metadata reuse. Require two agreeing epochs.
+  const bool pressured = uint64_t{misses} * 4 >= uint64_t{accesses} * 3;
+  int vote = 0;
+  if (reserved_metadata_ways == 0) {
+    vote = pairs > 0 ? 1 : 0; // Trial allocation after observing training at zero ways.
+  } else if (lookups == 0 || hits * 8 < lookups || (pressured && hits * 4 < lookups)) {
+    vote = -1;
+  } else if (!pressured && hits * 4 >= lookups && hits * 4 <= lookups * 3 && reserved_metadata_ways < metadata_capacity_ways) {
+    vote = 1;
+  }
+
+  if (vote != 0 && vote == state.last_vote) {
+    const auto next = vote > 0 ? std::clamp(static_cast<uint64_t>(reserved_metadata_ways) * 2, uint64_t{1}, uint64_t{metadata_capacity_ways})
+                               : reserved_metadata_ways / 2;
+    request_metadata_ways(static_cast<uint32_t>(next));
+    state.last_vote = 0;
+  } else {
+    state.last_vote = vote;
+  }
+}
+
+uint64_t CACHE::metadata_line::read(std::size_t slot) const
+{
+  constexpr uint64_t entry_mask = (uint64_t{1} << metadata_entry_bits) - 1;
+  const auto bit = slot * metadata_entry_bits;
+  const auto word = bit / 64;
+  const auto shift = bit % 64;
+  auto entry = payload[word] >> shift;
+  if (shift + metadata_entry_bits > 64)
+    entry |= payload[word + 1] << (64 - shift);
+  return entry & entry_mask;
+}
+
+void CACHE::metadata_line::write(std::size_t slot, uint64_t entry)
+{
+  constexpr uint64_t entry_mask = (uint64_t{1} << metadata_entry_bits) - 1;
+  const auto bit = slot * metadata_entry_bits;
+  const auto word = bit / 64;
+  const auto shift = bit % 64;
+  payload[word] = (payload[word] & ~(entry_mask << shift)) | (entry << shift);
+  if (shift + metadata_entry_bits > 64) {
+    const auto low_bits = 64 - shift;
+    payload[word + 1] = (payload[word + 1] & ~(entry_mask >> low_bits)) | (entry >> low_bits);
+  }
+}
+
+uint64_t CACHE::metadata_tag(uint64_t trigger) const
+{
+  uint64_t tag = 0;
+  // The low line-number bits select the set. XOR-fold the remaining bits into the tag.
+  for (auto high = trigger / NUM_SET; high != 0; high >>= metadata_tag_bits)
+    tag ^= high & metadata_tag_mask;
+  return tag;
+}
+
+CACHE::metadata_position CACHE::find_metadata(uint64_t trigger, uint64_t tag)
+{
+  const auto set = static_cast<std::size_t>(trigger % NUM_SET);
+  const auto active_ways = metadata_ways_for_set(set);
+  const auto first_line = set * metadata_capacity_ways;
+  metadata_position oldest{&metadata_table[first_line], 0, false};
+  for (std::size_t way = 0; way < active_ways; ++way) {
+    auto& line = metadata_table[first_line + way];
+    for (std::size_t slot = 0; slot < metadata_entries_per_way; ++slot) {
+      const auto stamp = line.last_used[slot];
+      if (stamp != 0 && (line.read(slot) & metadata_tag_mask) == tag)
+        return {&line, slot, true};
+      if (stamp < oldest.line->last_used[oldest.slot])
+        oldest = {&line, slot, false};
+    }
+  }
+  return oldest;
+}
+
+std::optional<champsim::block_number> CACHE::lookup_metadata(champsim::block_number trigger)
+{
+  if (metadata_table.empty())
+    return std::nullopt;
+
+  const auto trigger_line = trigger.to<uint64_t>();
+  observe_dueller_metadata(trigger_line, false);
+  const bool sampling = partition && !partition->dueller && partition->epoch_length != 0 && partition->target == reserved_metadata_ways;
+  if (sampling)
+    ++partition->lookups;
+  if (metadata_ways_for_set(static_cast<std::size_t>(trigger_line % NUM_SET)) == 0)
+    return std::nullopt;
+
+  const auto entry = find_metadata(trigger_line, metadata_tag(trigger_line));
+  if (!entry.hit)
+    return std::nullopt;
+
+  if (sampling)
+    ++partition->hits;
+  entry.line->last_used[entry.slot] = ++metadata_clock;
+  const auto target = (entry.line->read(entry.slot) >> metadata_tag_bits) & metadata_target_mask;
+  return champsim::block_number{target};
+}
+
+void CACHE::update_metadata(champsim::block_number trigger, champsim::block_number target)
+{
+  auto target_line = target.to<uint64_t>();
+  if (metadata_table.empty() || target_line > metadata_target_mask)
+    return;
+
+  const auto trigger_line = trigger.to<uint64_t>();
+  observe_dueller_metadata(trigger_line, true);
+  if (partition && !partition->dueller && partition->epoch_length != 0 && partition->target == reserved_metadata_ways)
+    ++partition->training_pairs;
+  if (metadata_ways_for_set(static_cast<std::size_t>(trigger_line % NUM_SET)) == 0)
+    return;
+
+  const auto tag = metadata_tag(trigger_line);
+  const auto entry = find_metadata(trigger_line, tag);
+  bool changed_prediction = entry.line->last_used[entry.slot] != 0;
+  bool confident = false;
+  if (entry.hit) {
+    const auto previous = entry.line->read(entry.slot);
+    const auto old_target = (previous >> metadata_tag_bits) & metadata_target_mask;
+    confident = old_target == target_line;
+    if ((previous >> metadata_confidence_bit) != 0)
+      target_line = old_target;
+    changed_prediction = old_target != target_line;
+  }
+  if (changed_prediction && !metadata_set_revisions.empty())
+    ++metadata_set_revisions[trigger_line % NUM_SET];
+
+  const auto encoded = tag | (target_line << metadata_tag_bits) | (uint64_t{confident} << metadata_confidence_bit);
+  entry.line->write(entry.slot, encoded);
+  entry.line->last_used[entry.slot] = ++metadata_clock;
 }
 
 // LCOV_EXCL_START exclude deprecated function
@@ -553,20 +907,22 @@ uint64_t CACHE::get_way(uint64_t address, uint64_t /*unused set index*/) const
 {
   champsim::address intern_addr{address};
   auto [begin, end] = get_set_span(intern_addr);
-  return static_cast<uint64_t>(std::distance(begin, std::find_if(begin, end, matches_address(champsim::address{address}))));
+  const auto way = std::find_if(begin, end, matches_address(intern_addr));
+  return way == end ? NUM_WAY : static_cast<uint64_t>(std::distance(begin, way));
 }
 // LCOV_EXCL_STOP
 
 long CACHE::invalidate_entry(champsim::address inval_addr)
 {
   auto [begin, end] = get_set_span(inval_addr);
-  auto inv_way = std::find_if(begin, end, matches_address(inval_addr));
+  auto inv_way = std::find_if(begin, end, [match = matches_address(inval_addr)](const auto& block) { return block.valid && match(block); });
 
   if (inv_way != end) {
+    pref_module_pimpl->impl_prefetcher_on_evict(inv_way->address);
     inv_way->valid = false;
   }
 
-  return std::distance(begin, inv_way);
+  return inv_way == end ? static_cast<long>(NUM_WAY) : std::distance(begin, inv_way);
 }
 
 bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
@@ -845,6 +1201,10 @@ void CACHE::begin_phase()
 
   new_roi_stats.name = NAME;
   new_sim_stats.name = NAME;
+  new_roi_stats.partition.enabled = new_sim_stats.partition.enabled = partition.has_value();
+  new_roi_stats.partition.ways_at_end = new_sim_stats.partition.ways_at_end = reserved_metadata_ways;
+  new_roi_stats.sms_filter.enabled = new_sim_stats.sms_filter.enabled = sim_stats.sms_filter.enabled;
+  new_roi_stats.triangel.enabled = new_sim_stats.triangel.enabled = sim_stats.triangel.enabled;
 
   roi_stats = new_roi_stats;
   sim_stats = new_sim_stats;
@@ -872,6 +1232,9 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.pf_useful = sim_stats.pf_useful;
   roi_stats.pf_useless = sim_stats.pf_useless;
   roi_stats.pf_fill = sim_stats.pf_fill;
+  roi_stats.partition = sim_stats.partition;
+  roi_stats.sms_filter = sim_stats.sms_filter;
+  roi_stats.triangel = sim_stats.triangel;
 
   for (auto* ul : upper_levels) {
     ul->roi_stats.RQ_ACCESS = ul->sim_stats.RQ_ACCESS;

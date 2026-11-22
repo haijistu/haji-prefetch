@@ -323,6 +323,15 @@ class ParseNormalizedTests(unittest.TestCase):
 
 class NormalizeConfigTest(unittest.TestCase):
 
+    def test_reusing_dram_config_preserves_data_rate(self):
+        for timings in ({'data_rate': 3200}, {'frequency': 3200}):
+            with self.subTest(timings=timings):
+                test_config = {'physical_memory': dict(timings)}
+                for _ in range(5):
+                    result = config.parse.NormalizedConfiguration(test_config)
+                    self.assertEqual(result.pmem, {'data_rate': 3200, 'frequency': 1600})
+                self.assertEqual(test_config['physical_memory'], timings)
+
     def test_empty_config_creates_defaults(self):
         result = config.parse.NormalizedConfiguration({})
         self.assertEqual(len(result.cores), 1)
