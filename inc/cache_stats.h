@@ -1,11 +1,14 @@
 #ifndef CACHE_STATS_H
 #define CACHE_STATS_H
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
+#include "block.h"
 #include "channel.h"
 #include "event_counter.h"
 
@@ -42,6 +45,25 @@ struct cache_stats {
       return {pairs_from_misses.same_region + pairs_from_prefetch_hits.same_region, pairs_from_misses.cross_region + pairs_from_prefetch_hits.cross_region};
     }
   } sms_filter{};
+  struct triage_prefetch_stats {
+    struct source_stats {
+      uint64_t issued{};
+      uint64_t timely_hits{};
+      uint64_t late_merges{};
+      uint64_t duplicates{};
+    };
+
+    static constexpr std::array source_names{
+        std::pair{champsim::triage_prefetch_source::triage, "triage"},
+        std::pair{champsim::triage_prefetch_source::sms_demand, "sms_demand"},
+        std::pair{champsim::triage_prefetch_source::sms_lookahead, "sms_lookahead"},
+    };
+
+    std::string_view mode{};
+    std::array<source_stats, static_cast<std::size_t>(champsim::triage_prefetch_source::count)> sources{};
+    source_stats& source(champsim::triage_prefetch_source src) { return sources.at(static_cast<std::size_t>(src)); }
+    const source_stats& source(champsim::triage_prefetch_source src) const { return sources.at(static_cast<std::size_t>(src)); }
+  } triage_prefetch{};
   struct triangel_stats {
     bool enabled{};
     uint64_t training_accesses{};

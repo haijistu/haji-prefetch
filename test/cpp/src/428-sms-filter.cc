@@ -1,4 +1,7 @@
+#include <algorithm>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 #include <catch.hpp>
 
@@ -13,20 +16,23 @@ constexpr uint64_t l2_sets = 128;
 
 champsim::address line_address(uint64_t line) { return champsim::address{champsim::block_number{line}}; }
 
+template <typename Prefetcher = triage_sms>
 struct sms_test_cache {
   champsim::channel upstream{8, 8, 8, offset_bits, false};
   champsim::channel downstream{1, 8, 8, offset_bits, false};
   CACHE llc{champsim::cache_builder{champsim::defaults::default_llc}.sets(128).ways(16).metadata_ways(4).hit_latency(1)};
-  CACHE l2{champsim::cache_builder{champsim::defaults::default_l2c}
+  CACHE l2;
+
+  explicit sms_test_cache(uint32_t degree = 4)
+      : l2(champsim::cache_builder{champsim::defaults::default_l2c}
                .sets(l2_sets)
                .ways(1)
                .hit_latency(1)
                .fill_latency(1)
                .upper_levels({&upstream})
                .lower_level(&downstream)
-               .prefetcher<triage_sms>()};
-
-  sms_test_cache()
+               .triage_sms_degree(degree)
+               .prefetcher<Prefetcher>())
   {
     l2.connect_lower_cache(llc);
     l2.initialize();
@@ -49,11 +55,11 @@ struct sms_test_cache {
     slot.prefetch = prefetched;
   }
 
-  void issue(uint64_t line, bool instruction = false)
+  void issue(uint64_t line, bool instruction = false, champsim::address ip = champsim::address{0x100})
   {
     champsim::channel::request_type request;
     request.address = line_address(line);
-    request.ip = champsim::address{0x100};
+    request.ip = ip;
     request.cpu = 0;
     request.is_instruction = instruction;
     REQUIRE(upstream.add_rq(request));
@@ -67,9 +73,19 @@ struct sms_test_cache {
     tick();
   }
 
-  void access(uint64_t line, bool instruction = false)
+  void complete_prefetch(uint64_t line)
   {
-    issue(line, instruction);
+    const auto request = std::find_if(downstream.PQ.begin(), downstream.PQ.end(),
+                                      [line](const auto& entry) { return entry.address == line_address(line); });
+    REQUIRE(request != downstream.PQ.end());
+    downstream.returned.emplace_back(*request);
+    downstream.PQ.erase(request);
+    tick();
+  }
+
+  void access(uint64_t line, bool instruction = false, champsim::address ip = champsim::address{0x100})
+  {
+    issue(line, instruction, ip);
     tick();
     if (!downstream.RQ.empty())
       complete_read();
@@ -219,4 +235,164 @@ TEST_CASE("An SMS accumulation generation ends when an observed line leaves L2",
   CHECK_FALSE(test.l2.block.at(65).address == line_address(65));
   test.access(65);
   CHECK(test.l2.sim_stats.sms_filter.passed_l2_misses == 3);
+}
+
+TEST_CASE("Demand-triggered SMS replays a footprint once per line and attributes useful prefetches", "[sms-prefetch]")
+{
+  using source = champsim::triage_prefetch_source;
+  sms_test_cache<triage_sms_spatial> test{2};
+  for (const uint64_t line : {67, 69, 73, 75}) {
+    test.seed_hit(line);
+    test.access(line);
+  }
+  test.l2.invalidate_entry(line_address(69));
+
+  // Both predictors want line 133. SMS can issue before the LLC metadata lookup finishes.
+  test.llc.update_metadata(champsim::block_number{131}, champsim::block_number{133});
+  test.seed_hit(131, true);
+  test.access(131);
+  test.tick();
+
+  const auto& stats = test.l2.sim_stats.triage_prefetch;
+  CHECK(stats.mode == "sms_spatial");
+  REQUIRE(test.downstream.PQ.size() == 2);
+  CHECK(test.downstream.PQ.at(0).address == line_address(133));
+  CHECK(test.downstream.PQ.at(1).address == line_address(137));
+  CHECK(stats.source(source::sms_demand).issued == 2);
+  CHECK(stats.source(source::triage).duplicates == 1);
+
+  test.complete_prefetch(133);
+  test.access(133);
+  test.access(137); // The request merges with an outstanding SMS prefetch.
+  CHECK(stats.source(source::sms_demand).timely_hits == 1);
+  CHECK(stats.source(source::sms_demand).late_merges == 1);
+  CHECK(stats.source(source::sms_lookahead).issued == 0);
+  test.l2.end_phase(0);
+  CHECK(test.l2.roi_stats.triage_prefetch.source(source::sms_demand).late_merges == 1);
+}
+
+TEMPLATE_TEST_CASE("Only lookahead SMS expands a temporal prediction before demand reaches its target region", "[sms-prefetch]", triage_sms_spatial,
+                   triage_sms_lookahead, triage_sms_lookahead_current_pc)
+{
+  using source = champsim::triage_prefetch_source;
+  sms_test_cache<TestType> test;
+  const bool stable_pattern = GENERATE(false, true);
+
+  // Two completed footprints share offset 5. Offset 13 appears only in the newest footprint.
+  for (const uint64_t base : {64, 128}) {
+    if (base == 64 && !stable_pattern)
+      continue;
+    for (const auto offset : {3, 5, 9, 13})
+      test.seed_hit(base + offset);
+    test.access(base + 3);
+    test.access(base + 5);
+    test.access(base + (base == 64 ? 9 : 13));
+    for (const auto offset : {3, 5, 9, 13})
+      test.l2.invalidate_entry(line_address(base + offset));
+  }
+
+  constexpr uint64_t trigger = 260;
+  constexpr uint64_t target = 323;
+  constexpr uint64_t stable_neighbor = target + 2;
+  constexpr uint64_t latest_neighbor = target + 10;
+  test.seed_hit(trigger, true);
+  test.seed_hit(target, true);
+  test.seed_hit(stable_neighbor);
+  test.seed_hit(latest_neighbor);
+  test.access(trigger);
+  test.access(target);
+  for (const auto line : {trigger, target, stable_neighbor, latest_neighbor})
+    test.l2.invalidate_entry(line_address(line));
+
+  test.l2.begin_phase();
+  test.access(trigger);
+  const auto& stats = test.l2.sim_stats.triage_prefetch;
+  const bool expanded = !std::is_same_v<TestType, triage_sms_spatial> && stable_pattern;
+  REQUIRE(test.downstream.PQ.size() == (expanded ? 2 : 1));
+  CHECK(test.downstream.PQ.front().address == line_address(target));
+  CHECK(stats.source(source::triage).issued == 1);
+  CHECK(stats.source(source::sms_demand).issued == 0);
+  CHECK(stats.source(source::sms_lookahead).issued == (expanded ? 1 : 0));
+  if (expanded)
+    CHECK(test.downstream.PQ.back().address == line_address(stable_neighbor));
+
+  test.complete_prefetch(target);
+  test.access(target);
+  test.tick();
+  CHECK(stats.source(source::triage).timely_hits == 1);
+  CHECK(stats.source(source::sms_demand).issued == (expanded ? 1 : 2));
+  CHECK(test.downstream.PQ.back().address == line_address(latest_neighbor));
+}
+
+TEMPLATE_TEST_CASE("SMS lookahead selects the history for the recorded or current PC", "[sms-prefetch]", triage_sms_lookahead,
+                   triage_sms_lookahead_current_pc)
+{
+  using source = champsim::triage_prefetch_source;
+  sms_test_cache<TestType> test;
+  const champsim::address recorded_pc{0x100};
+  const champsim::address current_pc{0x200};
+  constexpr uint64_t trigger = 260;
+  constexpr uint64_t target = 323;
+
+  for (const uint64_t base : {64, 128}) {
+    for (const auto& [pc, offset] : {std::pair{recorded_pc, 5}, std::pair{current_pc, 7}}) {
+      test.seed_hit(base + 3);
+      test.seed_hit(base + offset);
+      test.access(base + 3, false, pc);
+      test.access(base + offset, false, pc);
+      test.l2.invalidate_entry(line_address(base + 3));
+      test.l2.invalidate_entry(line_address(base + offset));
+    }
+  }
+
+  test.seed_hit(trigger, true);
+  test.seed_hit(target, true);
+  test.seed_hit(target + 2);
+  test.access(trigger, false, recorded_pc);
+  test.access(target, false, recorded_pc);
+  for (const auto line : {trigger, target, target + 2})
+    test.l2.invalidate_entry(line_address(line));
+
+  test.l2.begin_phase();
+  test.access(trigger, false, current_pc);
+
+  constexpr bool uses_current_pc = std::is_same_v<TestType, triage_sms_lookahead_current_pc>;
+  const auto& stats = test.l2.sim_stats.triage_prefetch;
+  CHECK(stats.mode == (uses_current_pc ? "sms_lookahead_current_pc" : "sms_lookahead"));
+  REQUIRE(test.downstream.PQ.size() == 2);
+  CHECK(test.downstream.PQ.front().address == line_address(target));
+  CHECK(test.downstream.PQ.back().address == line_address(target + (uses_current_pc ? 4 : 2)));
+  CHECK(stats.source(source::sms_lookahead).issued == 1);
+}
+
+TEMPLATE_TEST_CASE("Only current-PC lookahead expands a cross-region prediction without an exact transition", "[sms-prefetch]", triage_sms_lookahead,
+                   triage_sms_lookahead_current_pc)
+{
+  using source = champsim::triage_prefetch_source;
+  sms_test_cache<TestType> test;
+  const bool cross_region = GENERATE(false, true);
+  constexpr uint64_t trigger = 260;
+  const uint64_t target = cross_region ? 323 : 259;
+
+  for (const uint64_t base : {64, 128}) {
+    test.seed_hit(base + 3);
+    test.seed_hit(base + 5);
+    test.access(base + 3);
+    test.access(base + 5);
+    test.l2.invalidate_entry(line_address(base + 3));
+    test.l2.invalidate_entry(line_address(base + 5));
+  }
+
+  // Supply a Markov prediction directly without observing a training pair at L2.
+  test.llc.update_metadata(champsim::block_number{trigger}, champsim::block_number{target});
+  test.seed_hit(trigger, true);
+  test.access(trigger);
+  test.tick();
+
+  const bool expanded = cross_region && std::is_same_v<TestType, triage_sms_lookahead_current_pc>;
+  REQUIRE(test.downstream.PQ.size() == (expanded ? 2 : 1));
+  CHECK(test.downstream.PQ.front().address == line_address(target));
+  if (expanded)
+    CHECK(test.downstream.PQ.back().address == line_address(target + 2));
+  CHECK(test.l2.sim_stats.triage_prefetch.source(source::sms_lookahead).issued == (expanded ? 1 : 0));
 }

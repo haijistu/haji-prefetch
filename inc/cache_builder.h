@@ -49,6 +49,7 @@ struct cache_builder_base {
   uint32_t m_metadata_ways{};
   uint32_t m_metadata_max_ways{};
   uint32_t m_metadata_partition_epoch{};
+  uint32_t m_triage_sms_degree{4};
   std::size_t m_pq_size{std::numeric_limits<std::size_t>::max()};
   std::optional<uint32_t> m_mshr_size{};
   std::optional<uint64_t> m_hit_lat{};
@@ -110,6 +111,12 @@ public:
   self_type& metadata_partition_epoch(uint32_t accesses)
   {
     m_metadata_partition_epoch = accesses;
+    return *this;
+  }
+
+  self_type& triage_sms_degree(uint32_t degree)
+  {
+    m_triage_sms_degree = degree;
     return *this;
   }
 

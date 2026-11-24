@@ -38,7 +38,7 @@ CACHE::CACHE(CACHE&& other)
     : operable(other),
       reserved_metadata_ways(other.reserved_metadata_ways), metadata_capacity_ways(other.metadata_capacity_ways), partition(std::move(other.partition)),
       metadata_table(std::move(other.metadata_table)), metadata_clock(other.metadata_clock), metadata_set_revisions(std::move(other.metadata_set_revisions)),
-      lower_cache(other.lower_cache),
+      lower_cache(other.lower_cache), sms_degree(other.sms_degree),
 
       upper_levels(std::move(other.upper_levels)), lower_level(std::move(other.lower_level)), lower_translate(std::move(other.lower_translate)),
 
@@ -68,6 +68,7 @@ auto CACHE::operator=(CACHE&& other) -> CACHE&
   this->metadata_clock = other.metadata_clock;
   this->metadata_set_revisions = std::move(other.metadata_set_revisions);
   this->lower_cache = other.lower_cache;
+  this->sms_degree = other.sms_degree;
 
   this->upper_levels = std::move(other.upper_levels);
   this->lower_level = std::move(other.lower_level);
@@ -114,7 +115,8 @@ CACHE::tag_lookup_type::tag_lookup_type(const request_type& req, bool local_pref
 
 CACHE::fill_type::fill_type(const tag_lookup_type& req, champsim::chrono::clock::time_point _time_enqueued)
     : address(req.address), v_address(req.v_address), ip(req.ip), instr_id(req.instr_id), cpu(req.cpu), type(req.type),
-      prefetch_from_this(req.prefetch_from_this), time_enqueued(_time_enqueued), instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
+      prefetch_from_this(req.prefetch_from_this), prefetch_source(req.prefetch_source), time_enqueued(_time_enqueued),
+      instr_depend_on_me(req.instr_depend_on_me), to_return(req.to_return)
 {
 }
 
@@ -163,6 +165,7 @@ auto CACHE::fill_block(fill_type fill, uint32_t metadata) -> BLOCK
   to_fill.data = fill.data_promise->data;
   to_fill.pf_metadata = metadata;
   to_fill.cpu = fill.cpu;
+  to_fill.prefetch_source = fill.prefetch_source;
 
   return to_fill;
 }
@@ -312,6 +315,8 @@ bool CACHE::try_hit(const tag_lookup_type& handle_pkt)
     // update prefetch stats and reset prefetch bit
     if (useful_prefetch) {
       ++sim_stats.pf_useful;
+      if (way->prefetch_source != champsim::triage_prefetch_source::none)
+        ++sim_stats.triage_prefetch.source(way->prefetch_source).timely_hits;
       way->prefetch = false;
     }
   }
@@ -379,6 +384,8 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       // Mark the prefetch as useful
       if (fill_entry->prefetch_from_this) {
         ++sim_stats.pf_useful;
+        if (fill_entry->prefetch_source != champsim::triage_prefetch_source::none)
+          ++sim_stats.triage_prefetch.source(fill_entry->prefetch_source).late_merges;
       }
     }
 
@@ -650,6 +657,19 @@ bool CACHE::has_demanded_line(champsim::block_number line) const
   const champsim::address addr{line};
   const auto [first, last] = get_set_span(addr);
   return std::any_of(first, last, [matches = matches_address(addr)](const auto& entry) { return entry.valid && !entry.prefetch && matches(entry); });
+}
+
+bool CACHE::has_pending_or_cached_line(champsim::block_number line) const
+{
+  const champsim::address addr{line};
+  const auto matches = matches_address(addr);
+  const auto [first, last] = get_set_span(addr);
+  const auto translated_and_matches = [&](const auto& entry) { return entry.is_translated && matches(entry); };
+  return std::any_of(first, last, [&](const auto& entry) { return entry.valid && matches(entry); })
+         || std::any_of(MSHR.begin(), MSHR.end(), matches) || std::any_of(inflight_fills.begin(), inflight_fills.end(), matches)
+         || std::any_of(internal_PQ.begin(), internal_PQ.end(), translated_and_matches)
+         || std::any_of(inflight_tag_check.begin(), inflight_tag_check.end(), translated_and_matches)
+         || std::any_of(translation_stash.begin(), translation_stash.end(), translated_and_matches);
 }
 
 namespace
@@ -925,7 +945,7 @@ long CACHE::invalidate_entry(champsim::address inval_addr)
   return inv_way == end ? static_cast<long>(NUM_WAY) : std::distance(begin, inv_way);
 }
 
-bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata)
+bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata, champsim::triage_prefetch_source source)
 {
   ++sim_stats.pf_requested;
 
@@ -942,7 +962,10 @@ bool CACHE::prefetch_line(champsim::address pf_addr, bool fill_this_level, uint3
   pf_packet.is_translated = !virtual_prefetch;
 
   internal_PQ.emplace_back(pf_packet, true, !fill_this_level);
+  internal_PQ.back().prefetch_source = source;
   ++sim_stats.pf_issued;
+  if (source != champsim::triage_prefetch_source::none)
+    ++sim_stats.triage_prefetch.source(source).issued;
 
   return true;
 }
@@ -1204,6 +1227,7 @@ void CACHE::begin_phase()
   new_roi_stats.partition.enabled = new_sim_stats.partition.enabled = partition.has_value();
   new_roi_stats.partition.ways_at_end = new_sim_stats.partition.ways_at_end = reserved_metadata_ways;
   new_roi_stats.sms_filter.enabled = new_sim_stats.sms_filter.enabled = sim_stats.sms_filter.enabled;
+  new_roi_stats.triage_prefetch.mode = new_sim_stats.triage_prefetch.mode = sim_stats.triage_prefetch.mode;
   new_roi_stats.triangel.enabled = new_sim_stats.triangel.enabled = sim_stats.triangel.enabled;
 
   roi_stats = new_roi_stats;
@@ -1234,6 +1258,7 @@ void CACHE::end_phase(unsigned finished_cpu)
   roi_stats.pf_fill = sim_stats.pf_fill;
   roi_stats.partition = sim_stats.partition;
   roi_stats.sms_filter = sim_stats.sms_filter;
+  roi_stats.triage_prefetch = sim_stats.triage_prefetch;
   roi_stats.triangel = sim_stats.triangel;
 
   for (auto* ul : upper_levels) {

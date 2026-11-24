@@ -39,6 +39,8 @@ if __name__ == '__main__':
             help='The prefix for the configured outputs')
     path_group.add_argument('--bindir',
             help='The directory to store the resulting executables')
+    path_group.add_argument('--executable-name',
+            help='Override the executable name when the input resolves to a single configuration')
     path_group.add_argument('--makedir',
             help='The directory to store the resulting makefile fragment. Note that `make` must later be invoked with -I.')
 
@@ -82,6 +84,15 @@ if __name__ == '__main__':
     elif args.join == 'chain':
         config_files = ((c,) for c in itertools.chain(*files))
 
+    if args.executable_name is not None:
+        name = args.executable_name
+        if not name or name in ('.', '..') or os.path.basename(name) != name:
+            parser.error('--executable-name requires a file name')
+        selected = next(config_files, None)
+        if selected is None or next(config_files, None) is not None:
+            parser.error('--executable-name requires exactly one configuration. With make run, set PROGRAM to select an executable from a configuration list.')
+        config_files = (selected,)
+
     parsed_test = config.parse.parse_config({'executable_name': '000-test-main'}, module_dir=[os.path.join(test_root, 'cpp', 'modules')], compile_all_modules=True)
 
     parse_args = {
@@ -97,6 +108,8 @@ if __name__ == '__main__':
 
     with config.filewrite.FileWriter(bindir_name=bindir_name, objdir_name=objdir_name, makedir_name=args.makedir, verbose=args.verbose) as wr:
         for c in parsed_configs:
+            if args.executable_name is not None:
+                c = (args.executable_name, *c[1:])
             wr.write_files(c)
 
 # vim: set filetype=python:

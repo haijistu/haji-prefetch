@@ -486,14 +486,15 @@ def parse_config(*configs, module_dir=None, branch_dir=None, btb_dir=None, pref_
             print(k, v.paths)
     elements, module_info, config_file = merged_config.apply_defaults_in(**contexts, verbose=verbose)
 
+    # Module order contributes to the generated build ID.
     if compile_all_modules:
-        modules_to_compile = [*set(itertools.chain(*(d.keys() for d in module_info.values())))]
+        modules_to_compile = sorted({name for group in module_info.values() for name in group})
     else:
-        modules_to_compile = [*set(d['name'] for d in itertools.chain(
+        modules_to_compile = sorted({d['name'] for d in itertools.chain(
             *(c['_replacement_data'] for c in elements['caches']),
             *(c['_prefetcher_data'] for c in elements['caches']),
             *(c['_branch_predictor_data'] for c in elements['cores']),
             *(c['_btb_data'] for c in elements['cores'])
-        ))]
+        )})
 
     return executable_name(*configs), elements, modules_to_compile, module_info, config_file

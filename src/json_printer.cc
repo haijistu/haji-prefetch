@@ -51,6 +51,17 @@ void to_json(nlohmann::json& j, const CACHE::stats_type& stats)
   statsmap.emplace("prefetch issued", stats.pf_issued);
   statsmap.emplace("useful prefetch", stats.pf_useful);
   statsmap.emplace("useless prefetch", stats.pf_useless);
+  if (!stats.triage_prefetch.mode.empty()) {
+    nlohmann::json prefetch{{"mode", stats.triage_prefetch.mode}};
+    for (const auto& [origin, name] : stats.triage_prefetch.source_names) {
+      const auto& source = stats.triage_prefetch.source(origin);
+      prefetch[name] = {{"issued", source.issued},
+                        {"timely hits", source.timely_hits},
+                        {"late merges", source.late_merges},
+                        {"duplicates", source.duplicates}};
+    }
+    statsmap.emplace("triage prefetch", std::move(prefetch));
+  }
   if (stats.sms_filter.enabled) {
     const auto& sms = stats.sms_filter;
     const auto rate = [](uint64_t passed, uint64_t total) {

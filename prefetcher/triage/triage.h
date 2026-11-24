@@ -22,6 +22,15 @@ protected:
   // Returns the source line when training submits a correlation to the Markov table.
   std::optional<champsim::block_number> train(champsim::block_number current, champsim::address ip);
 
+  struct prediction {
+    champsim::block_number trigger;
+    champsim::block_number target;
+    champsim::address trigger_pc;
+    champsim::chrono::clock::time_point ready_at;
+  };
+
+  std::deque<prediction> pending;
+
 private:
   struct training_entry {
     champsim::address ip{};
@@ -35,13 +44,7 @@ private:
     auto tag() const { return ip; }
   };
 
-  struct prediction {
-    champsim::block_number target;
-    champsim::chrono::clock::time_point ready_at;
-  };
-
   champsim::msl::lru_table<training_entry> training_table{32, 16};
-  std::deque<prediction> pending;
 };
 
 #endif

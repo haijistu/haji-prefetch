@@ -79,6 +79,7 @@ cache_builder_parts = {
     'metadata_ways': '.metadata_ways({metadata_ways})',
     'metadata_max_ways': '.metadata_max_ways({metadata_max_ways})',
     'metadata_partition_epoch': '.metadata_partition_epoch({metadata_partition_epoch})',
+    'triage_sms_degree': '.triage_sms_degree({triage_sms_degree})',
     'pq_size': '.pq_size({pq_size})',
     'mshr_size': '.mshr_size({mshr_size})',
     'latency': '.latency({latency})',
@@ -149,6 +150,10 @@ def get_cache_builder(elem, ul_pairs):
         value = elem.get(key, 0)
         if type(value) is not int or not 0 <= value <= 0xFFFFFFFF:
             raise ValueError(f'{key} must be a non-negative integer representable by uint32_t')
+
+    degree = elem.get('triage_sms_degree', 4)
+    if type(degree) is not int or not 1 <= degree <= 63:
+        raise ValueError('triage_sms_degree must be an integer between 1 and 63')
 
     required_parts = [
         '.name("{name}")',
@@ -305,7 +310,7 @@ def module_include_files(datas):
     class_paths = (zip(itertools.repeat(module_data['class']), all_headers_on(module_data['path'])) for module_data in datas)
     candidates = set(itertools.chain.from_iterable(class_paths))
 
-    yield from (f'#include "{f}"' for _,f in candidates)
+    yield from (f'#include "{f}"' for _,f in sorted(candidates))
 
 def decorate_queues(caches, ptws, pmem):
     return util.chain(

@@ -26,7 +26,13 @@ vcpkg/vcpkg install
 
 # Compile
 
-ChampSim takes a JSON configuration script. Examine `champsim_config.json` for a fully-specified example. All options described in this file are optional and will be replaced with defaults if not specified. The configuration scrip can also be run without input, in which case an empty file is assumed.
+Pass a JSON configuration to the default Make target. Make runs `config.sh` first and builds the executables named by that configuration.
+
+```sh
+make -j8 CONFIG=champsim_config/champsim_config.json
+```
+
+On a fresh checkout, plain `make` uses `champsim_config/champsim_config.json`. If you have already generated a configuration, plain `make` uses it. You can also configure manually, including running `./config.sh` with no arguments to use the simulator defaults.
 ```
 $ ./config.sh <configuration file>
 $ make
@@ -40,12 +46,47 @@ Storage for these traces is kindly provided by Daniel Jimenez (Texas A&M Univers
 
 # Run simulation
 
-Execute the binary directly.
+Build with `CONFIG`, then select an executable under `bin/` using `PROGRAM`. Use `TRACE` with `run` for one trace and `TRACE_DIR` with `run-all` for a batch.
+
+```sh
+make -j8 CONFIG=champsim_config/Triage-sms.json
+make run PROGRAM=triage-sms-4way TRACE=471.omnetpp-188B.champsimtrace.xz
+make run-all PROGRAM=triage-sms-4way TRACE_DIR="$HOME/data/SPEC2006" JOBS=16
+```
+
+Both targets write logs to `log/<PROGRAM>/` by default. The single-trace target displays the output and writes a uniquely named `<trace-file>.<id>.log`. The batch target skips a trace if its exact `<trace-file>.log` exists. Failed runs leave `.partial` logs, which can be retried. Set a fresh `LOG_DIR` for an independent batch, including when changing the instruction counts.
+
+You can also pass `CONFIG` directly to `run` or `run-all` to build and run in one command. Set `PROGRAM` to select an executable from that configuration. For a single-configuration input with no `PROGRAM`, this workflow names the executable after the final JSON file.
+
+You can also invoke the executable directly.
 ```
 $ bin/champsim --warmup-instructions 200000000 --simulation-instructions 500000000 ~/path/to/traces/600.perlbench_s-210B.champsimtrace.xz
 ```
 
 The number of warmup and simulation instructions given will be the number of instructions retired. Note that the statistics printed at the end of the simulation include only the simulation phase.
+
+## Triage and SMS experiments
+
+Build the original four L2 prefetcher variants and the current-PC Lookahead variant with the same base configuration and four LLC metadata ways.
+
+```sh
+make -j8 CONFIG=champsim_config/Triage-sms-modes.json
+make -j8 CONFIG=champsim_config/Triage-sms-lookahead-current-pc.json
+```
+
+The Triage JSON files are self-contained. Use `Triage-sms.json` to build only the SMS-filter variant, `Triage-dynamic.json` for dynamic LLC metadata partitioning, and `Triage-ways.json` for the fixed metadata-way sweep.
+
+| Binary | L2 prefetcher class | Behavior |
+| --- | --- | --- |
+| `triage-4way` | `triage` | Triage with its original training stream |
+| `triage-sms-4way` | `triage_sms` | SMS filters Triage training |
+| `triage-sms-spatial-4way` | `triage_sms_spatial` | Demand-triggered SMS shares the L2 prefetch queue with Triage |
+| `triage-sms-lookahead-4way` | `triage_sms_lookahead` | Uses an exact cross-region transition table to recover the historical target PC for stable footprint replay |
+| `triage-sms-lookahead-current-pc-4way` | `triage_sms_lookahead_current_pc` | Uses the current demand PC and predicted target offset for stable footprint replay across regions |
+
+Edit `L2C.prefetcher` to select a class. The spatial and Lookahead variants accept `L2C.triage_sms_degree` from 1 to 63, with a default of 4 candidates per pattern expansion. Re-run `make CONFIG=...` after changing the JSON.
+
+The spatial and Lookahead variants use a 512-entry pattern history table. Both Lookahead variants replay the intersection of the two most recent completed footprints for the selected PC and offset. The original Lookahead allocates an 8,192-entry exact transition table. The current-PC variant carries the demand PC with each pending Triage prediction. Both report speculative requests under `sms_lookahead` in the L2 JSON statistics, with the variant identified by `triage prefetch.mode`.
 
 # Add your own branch predictor, data prefetchers, and replacement policy
 **Copy an empty template**

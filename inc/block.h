@@ -17,10 +17,14 @@
 #ifndef BLOCK_H
 #define BLOCK_H
 
-#include "champsim.h"
+#include <cstdint>
+
+#include "address.h"
 
 namespace champsim
 {
+enum class triage_prefetch_source : uint8_t { none, triage, sms_demand, sms_lookahead, count };
+
 struct cache_block {
   bool valid = false;
   bool prefetch = false;
@@ -32,6 +36,7 @@ struct cache_block {
 
   uint32_t pf_metadata = 0;
   uint32_t cpu = 0;
+  triage_prefetch_source prefetch_source{};
 };
 } // namespace champsim
 

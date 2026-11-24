@@ -25,6 +25,13 @@ cache_stats operator-(cache_stats lhs, cache_stats rhs)
                         lhs.sms_filter.pairs_from_misses.cross_region - rhs.sms_filter.pairs_from_misses.cross_region},
                        {lhs.sms_filter.pairs_from_prefetch_hits.same_region - rhs.sms_filter.pairs_from_prefetch_hits.same_region,
                         lhs.sms_filter.pairs_from_prefetch_hits.cross_region - rhs.sms_filter.pairs_from_prefetch_hits.cross_region}};
+  result.triage_prefetch.mode = lhs.triage_prefetch.mode;
+  for (std::size_t i = 0; i < result.triage_prefetch.sources.size(); ++i) {
+    const auto& left = lhs.triage_prefetch.sources[i];
+    const auto& right = rhs.triage_prefetch.sources[i];
+    result.triage_prefetch.sources[i] =
+        {left.issued - right.issued, left.timely_hits - right.timely_hits, left.late_merges - right.late_merges, left.duplicates - right.duplicates};
+  }
   result.triangel = {lhs.triangel.enabled,
                      lhs.triangel.training_accesses - rhs.triangel.training_accesses,
                      lhs.triangel.history_samples - rhs.triangel.history_samples,

@@ -8,19 +8,49 @@ BIN_ROOT:=bin
 OBJ_ROOT:=.csconfig
 DEP_ROOT:=$(OBJ_ROOT)
 
-# Run variables. TRACE can be relative to TRACE_DIR or an absolute path.
+# CONFIG selects the build configuration. Later JSON files take precedence.
+# TRACE can be relative to TRACE_DIR or an absolute path.
+CONFIG ?=
+ifneq ($(strip $(CONFIG)),)
+ifeq ($(origin PROGRAM),undefined)
+run run-all: PROGRAM = $(basename $(notdir $(lastword $(CONFIG))))
+run run-all: run_name_option = --executable-name=$(call quote_run_arg,$(PROGRAM))
+endif
+endif
 PROGRAM ?= triage-sms-4way
 TRACE_DIR ?= $(HOME)/data/SPEC2006
 TRACE ?=
 LOG_DIR ?= log
-WARMUP_INSTRUCTIONS ?= 200000000
+WARMUP_INSTRUCTIONS ?= 20000000
 SIMULATION_INSTRUCTIONS ?= 500000000
 JOBS ?= 16
 
 run_binary = $(BIN_ROOT)/$(PROGRAM)
 run_trace = $(if $(filter /%,$(firstword $(TRACE))),$(TRACE),$(TRACE_DIR)/$(TRACE))
+run_log_dir = $(LOG_DIR)/$(PROGRAM)
 quote_run_arg = '$(subst ','"'"',$(1))'
-configured_goals = $(filter-out clean compile_commands_clean configclean pytest maketest run run-all,$(or $(MAKECMDGOALS),all))
+configure = $(call quote_run_arg,$(ROOT_DIR)/config.sh) --bindir $(call quote_run_arg,$(BIN_ROOT)) $(2) -- $(foreach file,$(1),$(call quote_run_arg,$(file)))
+requested_goals = $(or $(MAKECMDGOALS),all)
+configured_goals = $(filter-out clean compile_commands_clean configclean pytest maketest run run-all,$(requested_goals))
+existing_configuration = $(wildcard _configuration.mk $(addsuffix /_configuration.mk,$(.INCLUDE_DIRS)))
+build_config = $(or $(strip $(CONFIG)),$(if $(existing_configuration),,champsim_config/champsim_config.json))
+
+.DEFAULT_GOAL := all
+
+# Read the generated rules in a fresh make invocation after configuration.
+ifneq (,$(and $(filter all,$(requested_goals)),$(build_config)))
+.PHONY: $(requested_goals) configure-and-build
+$(requested_goals): configure-and-build
+
+build_configured = $(MAKE) CONFIG= $(requested_goals)
+configure-and-build:
+	$(call configure,$(build_config))
+ifeq (,$(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS)))))
+	+$(build_configured)
+else
+	$(build_configured)
+endif
+else
 
 override MODULE_ROOT += $(ROOT_DIR)
 override BRANCH_ROOT += $(addsuffix /branch,$(MODULE_ROOT))
@@ -34,7 +64,7 @@ override CPPFLAGS += -I$(OBJ_ROOT)
 override LDFLAGS  += -L$(TRIPLET_DIR)/lib -L$(TRIPLET_DIR)/lib/manual-link
 override LDLIBS   += -lCLI11 -llzma -lz -lbz2 -lfmt
 
-.PHONY: all clean compile_commands compile_commands_clean configclean test pytest maketest run run-all
+.PHONY: all clean compile_commands compile_commands_clean configclean test pytest maketest run run-build run-all
 
 test_main_name=test/bin/000-test-main
 build_ids:=
@@ -101,8 +131,6 @@ rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(
 # Get the parent directory of a path
 # $1 - the path
 parent_dir = $(patsubst %/,%,$(dir $1))
-
-.DEFAULT_GOAL := all
 
 generated_files = $(OBJ_ROOT)/module_decl.inc $(OBJ_ROOT)/legacy_bridge.h
 module_dirs = $(foreach d,$(BRANCH_ROOT) $(BTB_ROOT) $(PREFETCH_ROOT) $(REPLACEMENT_ROOT),$(call relative_path,$(abspath $d),$(ROOT_DIR)))
@@ -231,14 +259,26 @@ all: $(executable_name)
 run:
 	@test -n $(call quote_run_arg,$(strip $(TRACE))) || { printf '%s\n' 'Specify a trace with make run TRACE=<trace-file>.' >&2; exit 2; }
 	@test -f $(call quote_run_arg,$(run_trace)) && test -r $(call quote_run_arg,$(run_trace)) || { printf 'Cannot read trace: %s\n' $(call quote_run_arg,$(run_trace)) >&2; exit 2; }
+ifneq ($(strip $(CONFIG)),)
+	$(call configure,$(CONFIG),$(run_name_option))
+	$(MAKE) run-build PROGRAM=$(call quote_run_arg,$(PROGRAM))
+endif
 	@test -f $(call quote_run_arg,$(run_binary)) && test -x $(call quote_run_arg,$(run_binary)) || { printf 'Cannot execute %s. Build the selected program first.\n' $(call quote_run_arg,$(run_binary)) >&2; exit 2; }
-	$(call quote_run_arg,$(run_binary)) --warmup-instructions $(call quote_run_arg,$(WARMUP_INSTRUCTIONS)) \
-		--simulation-instructions $(call quote_run_arg,$(SIMULATION_INSTRUCTIONS)) $(call quote_run_arg,$(run_trace))
+	bash $(call quote_run_arg,$(ROOT_DIR)/scripts/run_trace.sh) $(call quote_run_arg,$(run_log_dir)) \
+		$(call quote_run_arg,$(run_binary)) $(call quote_run_arg,$(run_trace)) \
+		$(call quote_run_arg,$(WARMUP_INSTRUCTIONS)) $(call quote_run_arg,$(SIMULATION_INSTRUCTIONS))
+
+run-build: $(filter $(run_binary),$(executable_name))
+	@test -n $(call quote_run_arg,$^) || { printf 'PROGRAM %s is absent from the selected configuration. Available programs: %s\n' $(call quote_run_arg,$(PROGRAM)) $(call quote_run_arg,$(notdir $(executable_name))) >&2; exit 2; }
 
 # JOBS limits concurrent simulations. Completed logs serve as resume markers.
 run-all:
+ifneq ($(strip $(CONFIG)),)
+	$(call configure,$(CONFIG),$(run_name_option))
+	$(MAKE) run-build PROGRAM=$(call quote_run_arg,$(PROGRAM))
+endif
 	@LC_ALL=C exec python3 $(call quote_run_arg,$(ROOT_DIR)/scripts/run_all.py) -- \
-		$(call quote_run_arg,$(run_binary)) $(call quote_run_arg,$(TRACE_DIR)) $(call quote_run_arg,$(LOG_DIR)/$(PROGRAM)) \
+		$(call quote_run_arg,$(run_binary)) $(call quote_run_arg,$(TRACE_DIR)) $(call quote_run_arg,$(run_log_dir)) \
 		$(call quote_run_arg,$(WARMUP_INSTRUCTIONS)) $(call quote_run_arg,$(SIMULATION_INSTRUCTIONS)) $(call quote_run_arg,$(JOBS))
 
 # Get the base object files, with the 'main' file mangled
@@ -368,3 +408,4 @@ endif
 
 .NOTINTERMEDIATE: $(dir $(base_module_objs) $(nonbase_module_objs))
 #.SECONDARY: $(call maybe_legacy_file,$(call get_module_src_dir,$(dir $(base_module_objs) $(nonbase_module_objs))),legacy_bridge.cc legacy_bridge.h legacy_bridge.inc function_patch.options legacy.options)
+endif

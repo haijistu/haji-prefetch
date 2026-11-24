@@ -121,6 +121,7 @@ def main():
 
     try:
         args.log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Program: {args.binary} | Log directory: {args.log_dir}", flush=True)
         with (args.log_dir / ".run-all.lock").open("ab") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

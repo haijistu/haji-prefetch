@@ -8,6 +8,7 @@ void triage::prefetcher_initialize()
 {
   if (intern_->get_lower_cache() == nullptr || intern_->virtual_prefetch)
     throw std::invalid_argument{"Triage needs a lower cache for metadata and physical prefetch addresses"};
+  intern_->sim_stats.triage_prefetch.mode = "triage";
 }
 
 uint32_t triage::prefetcher_cache_operate(champsim::address addr, champsim::address ip, bool cache_hit, bool useful_prefetch, access_type type,
@@ -32,7 +33,7 @@ std::optional<champsim::block_number> triage::train(champsim::block_number curre
 
   if (pending.size() < intern_->PQ_SIZE) {
     if (auto target = llc->lookup_metadata(current); target)
-      pending.push_back({*target, intern_->current_time + llc->HIT_LATENCY});
+      pending.push_back({current, *target, ip, intern_->current_time + llc->HIT_LATENCY});
   }
   if (previous) {
     llc->update_metadata(previous->last_address, current);
@@ -45,7 +46,7 @@ std::optional<champsim::block_number> triage::train(champsim::block_number curre
 void triage::prefetcher_cycle_operate()
 {
   while (!pending.empty() && pending.front().ready_at <= intern_->current_time) {
-    if (!prefetch_line(champsim::address{pending.front().target}, true, 0))
+    if (!intern_->prefetch_line(champsim::address{pending.front().target}, true, 0, champsim::triage_prefetch_source::triage))
       break;
     pending.pop_front();
   }

@@ -146,6 +146,14 @@ std::vector<std::string> champsim::plain_printer::format(CACHE::stats_type stats
     print_pairs("L2_PREFETCH_HIT", sms.pairs_from_prefetch_hits);
   }
 
+  if (!stats.triage_prefetch.mode.empty()) {
+    for (const auto& [origin, name] : stats.triage_prefetch.source_names) {
+      const auto& source = stats.triage_prefetch.source(origin);
+      lines.push_back(fmt::format("{} TRIAGE PREFETCH {} {}: ISSUED {} TIMELY_HITS {} LATE_MERGES {} DUPLICATES {}", stats.name,
+                                  stats.triage_prefetch.mode, name, source.issued, source.timely_hits, source.late_merges, source.duplicates));
+    }
+  }
+
   if (stats.triangel.enabled) {
     const auto& tri = stats.triangel;
     lines.push_back(fmt::format("{} TRIANGEL: TRAINING_ACCESSES {} HISTORY_SAMPLES {} HISTORY_MATCHES {} SECOND_CHANCE_HITS {} "

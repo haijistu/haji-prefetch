@@ -83,6 +83,7 @@ class CACHE : public champsim::operable
 
     std::vector<uint64_t> instr_depend_on_me{};
     std::vector<std::deque<response_type>*> to_return{};
+    champsim::triage_prefetch_source prefetch_source{};
 
     explicit tag_lookup_type(request_type req) : tag_lookup_type(req, false, false) {}
     tag_lookup_type(const request_type& req, bool local_pref, bool skip);
@@ -104,6 +105,7 @@ public:
 
     access_type type;
     bool prefetch_from_this;
+    champsim::triage_prefetch_source prefetch_source{};
 
     uint8_t asid[2] = {std::numeric_limits<uint8_t>::max(), std::numeric_limits<uint8_t>::max()};
 
@@ -198,6 +200,7 @@ private:
   uint64_t metadata_clock{};
   std::vector<uint64_t> metadata_set_revisions{};
   CACHE* lower_cache{};
+  uint32_t sms_degree{};
 
   std::pair<set_type::iterator, set_type::iterator> get_set_span(champsim::address address);
   [[nodiscard]] std::pair<set_type::const_iterator, set_type::const_iterator> get_set_span(champsim::address address) const;
@@ -237,6 +240,8 @@ public:
   void observe_reused_metadata(champsim::block_number trigger);
   [[nodiscard]] uint64_t metadata_revision(champsim::block_number trigger) const;
   [[nodiscard]] bool has_demanded_line(champsim::block_number line) const;
+  [[nodiscard]] bool has_pending_or_cached_line(champsim::block_number line) const;
+  [[nodiscard]] uint32_t triage_sms_degree() const { return sms_degree; }
   void connect_lower_cache(CACHE& cache) { lower_cache = &cache; }
   [[nodiscard]] CACHE* get_lower_cache() const { return lower_cache; }
   [[nodiscard]] std::optional<champsim::block_number> lookup_metadata(champsim::block_number trigger);
@@ -294,7 +299,8 @@ public:
   [[deprecated("This function should not be used to access the blocks directly.")]] [[nodiscard]] uint64_t get_way(uint64_t address, uint64_t set) const;
 
   long invalidate_entry(champsim::address inval_addr);
-  bool prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata);
+  bool prefetch_line(champsim::address pf_addr, bool fill_this_level, uint32_t prefetch_metadata,
+                     champsim::triage_prefetch_source source = champsim::triage_prefetch_source::none);
 
   [[deprecated]] bool prefetch_line(uint64_t pf_addr, bool fill_this_level, uint32_t prefetch_metadata);
 
@@ -424,7 +430,8 @@ public:
   template <typename... Ps, typename... Rs>
   explicit CACHE(champsim::cache_builder<champsim::cache_builder_module_type_holder<Ps...>, champsim::cache_builder_module_type_holder<Rs...>> b)
       : champsim::operable(b.m_clock_period), reserved_metadata_ways(b.m_metadata_ways),
-        metadata_capacity_ways(b.m_metadata_max_ways == 0 ? b.m_metadata_ways : b.m_metadata_max_ways), upper_levels(b.m_uls), lower_level(b.m_ll),
+        metadata_capacity_ways(b.m_metadata_max_ways == 0 ? b.m_metadata_ways : b.m_metadata_max_ways), sms_degree(b.m_triage_sms_degree),
+        upper_levels(b.m_uls), lower_level(b.m_ll),
         lower_translate(b.m_lt), NAME(b.m_name), NUM_SET(b.get_num_sets()),
         NUM_WAY(b.get_num_ways()), MSHR_SIZE(b.get_num_mshrs()), PQ_SIZE(b.m_pq_size), HIT_LATENCY(b.get_hit_latency() * b.m_clock_period),
         FILL_LATENCY(b.get_fill_latency() * b.m_clock_period), OFFSET_BITS(b.m_offset_bits), MAX_TAG(b.get_tag_bandwidth()), MAX_FILL(b.get_fill_bandwidth()),
